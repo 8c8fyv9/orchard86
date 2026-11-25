@@ -1,0 +1,264 @@
+diff --git a/hw/intc/arm_gicv2m.c b/hw/intc/arm_gicv2m.c
+index b343e17..d99440c 100644
+--- a/hw/intc/arm_gicv2m.c
++++ b/hw/intc/arm_gicv2m.c
+@@ -57,6 +57,7 @@ struct ARMGICv2mState {
+ 
+     uint32_t base_spi;
+     uint32_t num_spi;
++    bool platform_valid_bit;
+ };
+ 
+ static void gicv2m_set_irq(void *opaque, int irq)
+@@ -81,6 +82,9 @@ static uint64_t gicv2m_read(void *opaque, hwaddr offset,
+     case V2M_MSI_TYPER:
+         val = (s->base_spi + 32) << 16;
+         val |= s->num_spi;
++        if (s->platform_valid_bit) {
++            val |= 1U << 31;
++        }
+         return val;
+     case V2M_MSI_IIDR:
+         /* We don't have any valid implementor so we leave that field as zero
+@@ -171,6 +175,7 @@ static void gicv2m_init(Object *obj)
+ }
+ 
+ static const Property gicv2m_properties[] = {
++    DEFINE_PROP_BOOL("platform-valid-bit", ARMGICv2mState, platform_valid_bit, false),
+     DEFINE_PROP_UINT32("base-spi", ARMGICv2mState, base_spi, 0),
+     DEFINE_PROP_UINT32("num-spi", ARMGICv2mState, num_spi, 64),
+ };
+diff --git a/hw/vmapple/Kconfig b/hw/vmapple/Kconfig
+index af66355..b2b0c43 100644
+--- a/hw/vmapple/Kconfig
++++ b/hw/vmapple/Kconfig
+@@ -19,6 +19,7 @@ config VMAPPLE
+     default y
+     imply PCI_DEVICES
+     select ARM_GICV3
++    select ARM_GIC
+     select PLATFORM_BUS
+     select PCI_EXPRESS
+     select PCI_EXPRESS_GENERIC_BRIDGE
+diff --git a/hw/vmapple/protection-diagnostic.inc.c b/hw/vmapple/protection-diagnostic.inc.c
+new file mode 100644
+index 0000000..a8135f0
+--- /dev/null
++++ b/hw/vmapple/protection-diagnostic.inc.c
+@@ -0,0 +1,122 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++/* Local range-bank enforcement experiment. Default diagnostic mode has no
++ * capability header. Recovery opt-in exposes experimental geometry backed by
++ * actual readonly mappings; full permission-bit compatibility is not claimed.
++ * Endpoints are byte-inclusive, or inclusive page bases under explicit opt-in.
++ */
++static bool diagnostic_bank_slot(hwaddr offset, unsigned *slot, unsigned *field)
++{
++    if (offset < 0x40 || offset >= 0x140 || (offset & 7)) {
++        return false;
++    }
++    *slot = (offset - 0x40) / 0x20;
++    *field = ((offset - 0x40) % 0x20) / 8;
++    return *field < 3;
++}
++
++static uint64_t diagnostic_bank_read(void *opaque, hwaddr offset, unsigned size)
++{
++    VMAppleMachineState *vms = opaque;
++    unsigned slot, field;
++    if (vms->recovery_protection && offset < 0x40) {
++        uint64_t base = vms->memmap[VMAPPLE_MEM].base;
++        switch (offset) {
++        case 0: return 0x63747272;
++        case 4: return 1;
++        case 0xc: return 8; /* Actual total implemented slots. */
++        case 0x10: return 14; /* Actual protection granularity. */
++        case 0x20: return base;
++        case 0x28: return base + MACHINE(vms)->ram_size - 0x4000;
++        default: return 0;
++        }
++    }
++    if (!diagnostic_bank_slot(offset, &slot, &field)) {
++        return 0;
++    }
++    return vms->diagnostic_bank_regs[slot][field];
++}
++
++static void diagnostic_bank_write(void *opaque, hwaddr offset,
++                                  uint64_t value, unsigned size)
++{
++    VMAppleMachineState *vms = opaque;
++    MachineState *machine = MACHINE(vms);
++    unsigned slot, field;
++    uint64_t *r, base, start, end, length;
++
++    if (size != 8 || !diagnostic_bank_slot(offset, &slot, &field)) {
++        return;
++    }
++    r = vms->diagnostic_bank_regs[slot];
++    if (r[2] == 7) {
++        return; /* Local immutable commit; host toggle is not exposed here. */
++    }
++    if (field != 2) {
++        r[field] = value;
++        return;
++    }
++    if (value != 7) {
++        return;
++    }
++    base = vms->memmap[VMAPPLE_MEM].base;
++    start = r[0];
++    end = r[1];
++    if (vms->recovery_protection) {
++        if ((end & 0x3fff) || end > UINT64_MAX - 0x3fff) {
++            return;
++        }
++        end += 0x3fff;
++    }
++    if (start < base || end < start || end == UINT64_MAX ||
++        start - base >= machine->ram_size ||
++        end - base >= machine->ram_size ||
++        (start & 0x3fff) || ((end + 1) & 0x3fff)) {
++        return; /* Reject invalid commit without falsely reporting lock. */
++    }
++    length = end - start + 1;
++    memory_region_init_ram_ptr(&vms->diagnostic_bank_views[slot], NULL,
++                               "vmapple-diagnostic-bank", length,
++                               (uint8_t *)memory_region_get_ram_ptr(machine->ram)
++                               + start - base);
++    memory_region_set_readonly(&vms->diagnostic_bank_views[slot], true);
++    memory_region_add_subregion_overlap(get_system_memory(), start,
++                                        &vms->diagnostic_bank_views[slot], 2);
++    r[2] = 7; /* Report only after the real mapping was installed. */
++}
++
++static const MemoryRegionOps diagnostic_bank_ops = {
++    .read = diagnostic_bank_read,
++    .write = diagnostic_bank_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = { .min_access_size = 4, .max_access_size = 8,
++               .unaligned = false },
++    .impl = { .min_access_size = 4, .max_access_size = 8 },
++};
++
++static void diagnostic_bank_reset(void *opaque)
++{
++    VMAppleMachineState *vms = opaque;
++    memory_region_transaction_begin();
++    for (unsigned slot = 0; slot < 8; slot++) {
++        if (vms->diagnostic_bank_regs[slot][2] == 7) {
++            memory_region_del_subregion(get_system_memory(),
++                                        &vms->diagnostic_bank_views[slot]);
++            object_unparent(OBJECT(&vms->diagnostic_bank_views[slot]));
++        }
++    }
++    memset(vms->diagnostic_bank_regs, 0, sizeof(vms->diagnostic_bank_regs));
++    memory_region_transaction_commit();
++}
++
++static void create_diagnostic_banks(VMAppleMachineState *vms)
++{
++    if (!vms->recovery_protection) {
++        return;
++    }
++    memory_region_init_io(&vms->diagnostic_bank_mr, OBJECT(vms),
++                          &diagnostic_bank_ops, vms,
++                          "vmapple-diagnostic-range-banks", 0x1000);
++    memory_region_add_subregion(get_system_memory(), 0x30260000,
++                                &vms->diagnostic_bank_mr);
++    qemu_register_reset(diagnostic_bank_reset, vms);
++}
+diff --git a/hw/vmapple/vmapple.c b/hw/vmapple/vmapple.c
+index 11379cd..e1afc9e 100644
+--- a/hw/vmapple/vmapple.c
++++ b/hw/vmapple/vmapple.c
+@@ -15,6 +15,7 @@
+  */
+ 
+ #include "qemu/osdep.h"
++#include "migration/blocker.h"
+ #include "qemu/bitops.h"
+ #include "qemu/datadir.h"
+ #include "qemu/error-report.h"
+@@ -76,6 +77,11 @@ struct VMAppleMachineState {
+     bool recovery_rtc_selector;
+     uint64_t recovery_platform_control;
+     uint64_t recovery_platform_mask;
++    bool recovery_protection;
++    Error *diagnostic_protection_migration_blocker;
++    MemoryRegion diagnostic_bank_mr;
++    uint64_t diagnostic_bank_regs[8][3];
++    MemoryRegion diagnostic_bank_views[8];
+     MemoryRegion ecam_alias;
+ #ifndef CONFIG_MAC_PVG_MMIO
+     MemoryRegion gfx_stub_mr;
+@@ -330,6 +336,18 @@ static void create_gic(VMAppleMachineState *vms, MemoryRegion *mem)
+     sysbus_realize_and_unref(gicbusdev, &error_fatal);
+     sysbus_mmio_map(gicbusdev, 0, vms->memmap[VMAPPLE_GIC_DIST].base);
+     sysbus_mmio_map(gicbusdev, 1, vms->memmap[VMAPPLE_GIC_REDIST].base);
++    if (vms->recovery_protection) {
++        DeviceState *msi = qdev_new("arm-gicv2m");
++        qdev_prop_set_uint32(msi, "base-spi", 128);
++        qdev_prop_set_uint32(msi, "num-spi", 128);
++        qdev_prop_set_bit(msi, "platform-valid-bit", true);
++        sysbus_realize_and_unref(SYS_BUS_DEVICE(msi), &error_fatal);
++        sysbus_mmio_map(SYS_BUS_DEVICE(msi), 0, 0x1fff0000);
++        for (i = 0; i < 128; i++) {
++            sysbus_connect_irq(SYS_BUS_DEVICE(msi), i,
++                               qdev_get_gpio_in(vms->gic, 128 + i));
++        }
++    }
+ 
+     /*
+      * Wire the outputs from each CPU's generic timer and the GICv3
+@@ -366,6 +384,8 @@ static void create_uart(const VMAppleMachineState *vms, int uart,
+     sysbus_connect_irq(s, 0, qdev_get_gpio_in(vms->gic, irq));
+ }
+ 
++#include "protection-diagnostic.inc.c"
++
+ /* Local compatibility selector: advertises only the PL031 actually realized. */
+ static uint64_t vmapple_rtc_selector_read(void *opaque, hwaddr offset,
+                                          unsigned size)
+@@ -703,6 +723,13 @@ static void mach_vmapple_init(MachineState *machine)
+     create_gfx(vms, sysmem);
+     create_uart(vms, VMAPPLE_UART, sysmem, serial_hd(0));
+     create_rtc(vms);
++    if (vms->recovery_protection) {
++        error_setg(&vms->diagnostic_protection_migration_blocker,
++                   "VMApple recovery protection lacks migration state");
++        migrate_add_blocker(&vms->diagnostic_protection_migration_blocker,
++                            &error_fatal);
++    }
++    create_diagnostic_banks(vms);
+     create_pcie(vms);
+ 
+     create_gpio_devices(vms, VMAPPLE_GPIO, sysmem);
+@@ -809,6 +836,17 @@ static void vmapple_machine_class_init(ObjectClass *oc, const void *data)
+                      G_N_ELEMENTS(vmapple_compat_defaults));
+ }
+ 
++static bool vmapple_get_recovery_protection(Object *obj, Error **errp)
++{
++    return VMAPPLE_MACHINE(obj)->recovery_protection;
++}
++
++static void vmapple_set_recovery_protection(Object *obj, bool value,
++                                             Error **errp)
++{
++    VMAPPLE_MACHINE(obj)->recovery_protection = value;
++}
++
+ static bool vmapple_get_recovery_rtc_selector(Object *obj, Error **errp)
+ {
+     return VMAPPLE_MACHINE(obj)->recovery_rtc_selector;
+@@ -850,6 +888,9 @@ static void vmapple_instance_init(Object *obj)
+                                    OBJ_PROP_FLAG_READWRITE);
+     object_property_set_description(obj, "uuid", "Machine UUID (SDOM)");
+ 
++    object_property_add_bool(obj, "recovery-protection",
++                             vmapple_get_recovery_protection,
++                             vmapple_set_recovery_protection);
+     object_property_add_bool(obj, "recovery-rtc-selector",
+                              vmapple_get_recovery_rtc_selector,
+                              vmapple_set_recovery_rtc_selector);

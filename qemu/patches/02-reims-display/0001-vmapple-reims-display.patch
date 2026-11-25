@@ -1,0 +1,3775 @@
+diff --git a/hw/vmapple/meson.build b/hw/vmapple/meson.build
+index 31b7e049..fdd99cf9 100644
+--- a/hw/vmapple/meson.build
++++ b/hw/vmapple/meson.build
+@@ -5,4 +5,10 @@ system_ss.add(when: 'CONFIG_VMAPPLE_BDIF', if_true: files('bdif.c'))
+ system_ss.add(when: 'CONFIG_VMAPPLE_CFG',  if_true: files('cfg.c'))
+ system_ss.add(when: 'CONFIG_VMAPPLE_VIRTIO_BLK',  if_true: files('virtio-blk.c'))
+ system_ss.add(when: 'CONFIG_VMAPPLE_VIRTIO_BLK', if_true: files('virtio-usb.c'))
++# Optional local backend; builds without the package retain the inert probe.
++reims_vgpu = dependency('reims-vgpu', required: false)
++if reims_vgpu.found()
++  specific_ss.add(when: 'CONFIG_VMAPPLE', if_true: [reims_vgpu,
++    declare_dependency(compile_args: ['-DCONFIG_VMAPPLE_REIMS'])])
++endif
+ specific_ss.add(when: 'CONFIG_VMAPPLE',     if_true: files('vmapple.c'))
+diff --git a/hw/vmapple/reims-display-identity.h b/hw/vmapple/reims-display-identity.h
+new file mode 100644
+index 00000000..abc1ff35
+--- /dev/null
++++ b/hw/vmapple/reims-display-identity.h
+@@ -0,0 +1,28 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++#ifndef VMAPPLE_REIMS_DISPLAY_IDENTITY_H
++#define VMAPPLE_REIMS_DISPLAY_IDENTITY_H
++
++#include <stdint.h>
++#include <stdbool.h>
++#include <string.h>
++
++/* A host-owned persistent seed; zero keeps the unspecified legacy identity. */
++static inline bool reims_display_identity(uint64_t seed, unsigned port,
++                                          uint8_t uuid[16])
++{
++    memset(uuid, 0, 16);
++    if (!seed || port >= 8) {
++        return false;
++    }
++    uuid[0] = 0x72;
++    uuid[1] = 0x76;
++    uuid[2] = 0x67;
++    uuid[6] = 0x40;
++    uuid[8] = 0x80;
++    for (unsigned byte = 0; byte < 8; byte++) {
++        uuid[3 + byte + (byte >= 3) + (byte >= 4)] = seed >> (56 - byte * 8);
++    }
++    uuid[15] = port + 1;
++    return true;
++}
++#endif
+diff --git a/hw/vmapple/reims-display-mode.h b/hw/vmapple/reims-display-mode.h
+new file mode 100644
+index 00000000..d735fa4c
+--- /dev/null
++++ b/hw/vmapple/reims-display-mode.h
+@@ -0,0 +1,15 @@
++#ifndef VMAPPLE_REIMS_DISPLAY_MODE_H
++#define VMAPPLE_REIMS_DISPLAY_MODE_H
++
++#include <stdbool.h>
++#include <stdint.h>
++
++/* Bound the existing readback path, not the guest or hardware capabilities. */
++static inline bool vmapple_reims_mode_valid(uint64_t width, uint64_t height,
++                                            uint64_t refresh_hz)
++{
++    return width > 0 && width <= 4096 && height > 0 && height <= 4096 &&
++           refresh_hz > 0 && refresh_hz <= UINT32_MAX;
++}
++
++#endif
+diff --git a/hw/vmapple/reims-memory-ranges.h b/hw/vmapple/reims-memory-ranges.h
+new file mode 100644
+index 00000000..d3056b2b
+--- /dev/null
++++ b/hw/vmapple/reims-memory-ranges.h
+@@ -0,0 +1,33 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++#ifndef VMAPPLE_REIMS_MEMORY_RANGES_H
++#define VMAPPLE_REIMS_MEMORY_RANGES_H
++/* Return disjoint writable spans; protected intervals are never exported. */
++typedef struct VmappleRamSpan { uint64_t start, length; } VmappleRamSpan;
++static inline size_t vmapple_ram_complement(uint64_t base, uint64_t length,
++    const VmappleRamSpan *deny, size_t count, VmappleRamSpan *out, size_t capacity)
++{
++    uint64_t cursor = base, end;
++    size_t used = 0;
++    if (!length || length > UINT64_MAX - base) { return SIZE_MAX; }
++    end = base + length;
++    for (size_t i = 0; i < count; i++) {
++        if (!deny[i].length || deny[i].start < base ||
++            deny[i].start > end || deny[i].length > end - deny[i].start) {
++            return SIZE_MAX;
++        }
++    }
++    while (cursor < end) {
++        uint64_t next = end, covered = cursor;
++        for (size_t i = 0; i < count; i++) {
++            uint64_t stop = deny[i].start + deny[i].length;
++            if (deny[i].start <= cursor && stop > covered) { covered = stop; }
++            if (deny[i].start > cursor && deny[i].start < next) { next = deny[i].start; }
++        }
++        if (covered > cursor) { cursor = covered; continue; }
++        if (used == capacity) { return SIZE_MAX; }
++        out[used++] = (VmappleRamSpan){cursor, next - cursor};
++        cursor = next;
++    }
++    return used;
++}
++#endif
+diff --git a/hw/vmapple/reims.inc.c b/hw/vmapple/reims.inc.c
+new file mode 100644
+index 00000000..68bba65b
+--- /dev/null
++++ b/hw/vmapple/reims.inc.c
+@@ -0,0 +1,738 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later
++ * Optional adapter to the separately licensed Reims C API.
++ * MMIO lifecycle, serialized frame readback and host cursor callbacks.
++ */
++#ifdef CONFIG_VMAPPLE_REIMS
++static void reims_log(void *ctx, RvgLogLevel level, const char *target,
++                      size_t target_len, const char *message, size_t message_len)
++{
++    static const char present_target[] = "login_present";
++
++    /* No library calls or BQL from this callback. */
++    if (level > RVG_LOG_WARN) {
++        if (target_len == sizeof(present_target) - 1 &&
++            !memcmp(target, present_target, target_len)) {
++            fprintf(stderr, "Reims present host_ns=%" PRId64 " %.*s\n",
++                    qemu_clock_get_ns(QEMU_CLOCK_REALTIME),
++                    (int)MIN(message_len, 2048), message);
++        }
++        return;
++    }
++    fprintf(stderr, "Reims[%u] %.*s: %.*s\n", level,
++            (int)MIN(target_len, 256), target,
++            (int)MIN(message_len, 2048), message);
++}
++
++static void reims_irq_bh(void *opaque)
++{
++    VMAppleMachineState *vms = opaque;
++    unsigned pending = qatomic_xchg(&vms->reims_pending, 0);
++    if (vms->reims_irq_trace_count < UINT_MAX) {
++        unsigned count = ++vms->reims_irq_trace_count;
++        /* Sparse observations avoid a log write on every interrupt. */
++        if ((count & (count - 1)) == 0) {
++            trace_vmapple_reims_irq_status(
++                qemu_clock_get_ms(QEMU_CLOCK_REALTIME), 0, pending, count);
++        }
++    }
++    if (pending & 1) {
++        qemu_irq_pulse(qdev_get_gpio_in(vms->gic, vms->irqmap[VMAPPLE_APV_GFX]));
++    }
++    if (pending & 2) {
++        qemu_irq_pulse(qdev_get_gpio_in(vms->gic, vms->irqmap[VMAPPLE_APV_IOSFC]));
++    }
++}
++
++static void reims_gpu_irq(void *opaque, uint32_t vector)
++{
++    VMAppleMachineState *vms = opaque;
++    qatomic_or(&vms->reims_pending, 1);
++    qemu_bh_schedule(vms->reims_bh);
++}
++
++static void reims_surface_irq(void *opaque, uint32_t vector)
++{
++    VMAppleMachineState *vms = opaque;
++    qatomic_or(&vms->reims_pending, 2);
++    qemu_bh_schedule(vms->reims_bh);
++}
++
++static void reims_require(RvgStatus status, const char *operation)
++{
++    if (status != RVG_OK) {
++        error_report("Reims %s: %s", operation, rvg_status_message(status));
++        exit(EXIT_FAILURE);
++    }
++}
++
++static void reims_display_destroy(void *opaque)
++{
++    VMAppleReimsScreen *screen = opaque;
++    qemu_event_set(&screen->reims_display_done);
++}
++static void reims_device_destroy(void *opaque)
++{
++    VMAppleMachineState *vms = opaque;
++    qemu_event_set(&vms->reims_device_done);
++}
++static void reims_surface_destroy(void *opaque)
++{
++    VMAppleMachineState *vms = opaque;
++    qemu_event_set(&vms->reims_surface_done);
++}
++/* Reims serializes mode and frame callbacks on its display worker. */
++static void reims_mode(void *opaque, uint16_t width, uint16_t height,
++                       uint32_t format)
++{
++    VMAppleReimsScreen *screen = opaque;
++    screen->reims_width = width <= 4096 ? width : 0;
++    screen->reims_height = height <= 4096 ? height : 0;
++    info_report("Reims screen=%u mode %ux%u format=%u",
++                screen->index, width, height, format);
++}
++static void reims_readback_publish(VMAppleReimsScreen *screen, unsigned w,
++                                   unsigned h, int64_t started_ns,
++                                   int64_t alloc_ns, int64_t encode_ns,
++                                   int64_t wait_ns, int64_t readback_ns)
++{
++    VMAppleMachineState *vms = screen->machine;
++    uint8_t *pixels = screen->reims_pixels;
++    uint64_t published = 0;
++    int64_t now_ns = 0;
++    size_t row_bytes = (size_t)w * 4;
++    unsigned dirty_top = h, dirty_bottom = 0;
++    bool need_full = !screen->reims_prev_valid ||
++                     screen->reims_prev_width != w ||
++                     screen->reims_prev_height != h;
++
++    /* Lockless dirty-row scan outside bql_lock() */
++    if (need_full) {
++        dirty_top = 0;
++        dirty_bottom = h - 1;
++    } else {
++        for (unsigned y = 0; y < h; y++) {
++            const uint8_t *cur = pixels + (size_t)y * row_bytes;
++            const uint8_t *prv = screen->reims_prev_pixels +
++                                 (size_t)y * row_bytes;
++            if (memcmp(prv, cur, row_bytes) != 0) {
++                if (y < dirty_top) {
++                    dirty_top = y;
++                }
++                dirty_bottom = y;
++            }
++        }
++    }
++
++    bql_lock();
++    if (!qatomic_read(&vms->reims_stopping)) {
++        DisplaySurface *prev_surface = qemu_console_surface(screen->reims_console);
++        DisplaySurface *surface;
++        unsigned y;
++        bool full_copy;
++
++        qemu_console_resize(screen->reims_console, w, h);
++        surface = qemu_console_surface(screen->reims_console);
++        full_copy = need_full || (surface != prev_surface) ||
++                    (screen->reims_frames == 0);
++        if (full_copy) {
++            dirty_top = 0;
++            dirty_bottom = h - 1;
++        }
++        if (dirty_top <= dirty_bottom) {
++            for (y = dirty_top; y <= dirty_bottom; y++) {
++                memcpy((uint8_t *)surface_data(surface) +
++                           y * surface_stride(surface),
++                       pixels + (size_t)y * row_bytes, row_bytes);
++            }
++            qemu_console_update(screen->reims_console, 0, dirty_top, w,
++                                dirty_bottom - dirty_top + 1);
++        }
++        published = ++screen->reims_frames;
++        if (screen->reims_frames <= 3) {
++            info_report("Reims real frame readback #%" PRIu64 " %ux%u",
++                        screen->reims_frames, w, h);
++        }
++        now_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
++        screen->reims_stage_ns[0] += alloc_ns;
++        screen->reims_stage_ns[1] += encode_ns;
++        screen->reims_stage_ns[2] += wait_ns;
++        screen->reims_stage_ns[3] += readback_ns;
++        screen->reims_stage_ns[4] += now_ns - started_ns -
++                                     (alloc_ns + encode_ns + wait_ns + readback_ns);
++        screen->reims_snapshot_count = published;
++        screen->reims_snapshot_host_ns = now_ns;
++        memcpy(screen->reims_snapshot_stage_ns, screen->reims_stage_ns,
++               sizeof(screen->reims_snapshot_stage_ns));
++    }
++    bql_unlock();
++    {
++        uint8_t *tmp = screen->reims_prev_pixels;
++        screen->reims_prev_pixels = screen->reims_pixels;
++        screen->reims_pixels = tmp;
++        screen->reims_prev_width = w;
++        screen->reims_prev_height = h;
++        screen->reims_prev_valid = true;
++    }
++    if (published) {
++        screen->reims_frame_max_ns = MAX(screen->reims_frame_max_ns,
++                                         now_ns - started_ns);
++        if ((published & (published - 1)) == 0) {
++            info_report("Reims published frame count=%" PRIu64
++                        " host_ns=%" PRId64 " callback_max_ns=%" PRIu64,
++                        published, now_ns, screen->reims_frame_max_ns);
++            info_report("Reims screen=%u published=%" PRIu64,
++                        screen->index, published);
++            info_report("Reims screen=%u count=%" PRIu64
++                        " host_ns=%" PRId64 " stage cumulative_ns allocation=%" PRIu64
++                        " encode_commit=%" PRIu64 " wait=%" PRIu64
++                        " readback=%" PRIu64 " release_publish=%" PRIu64,
++                        screen->index, published, now_ns,
++                        screen->reims_stage_ns[0], screen->reims_stage_ns[1],
++                        screen->reims_stage_ns[2], screen->reims_stage_ns[3],
++                        screen->reims_stage_ns[4]);
++        }
++    }
++    trace_vmapple_reims_frame_end(screen->index, started_ns,
++                                published ? "published" : "suppressed");
++}
++
++static void *reims_readback_thread(void *opaque)
++{
++    VMAppleReimsScreen *screen = opaque;
++    VMAppleMachineState *vms = screen->machine;
++
++    for (;;) {
++        unsigned slot, w, h;
++        RvgFrame *frame;
++        int64_t started_ns, alloc_ns, encode_ns, t2, t3, t4;
++        RvgStatus status;
++
++        qemu_mutex_lock(&screen->reims_rb_lock);
++        while (screen->reims_rb_count == 0 && !screen->reims_rb_stop) {
++            qemu_cond_wait(&screen->reims_rb_cond, &screen->reims_rb_lock);
++        }
++        if (screen->reims_rb_count == 0 && screen->reims_rb_stop) {
++            qemu_mutex_unlock(&screen->reims_rb_lock);
++            break;
++        }
++        slot = screen->reims_rb_queue[screen->reims_rb_head].slot;
++        frame = screen->reims_rb_queue[screen->reims_rb_head].frame;
++        w = screen->reims_rb_queue[screen->reims_rb_head].w;
++        h = screen->reims_rb_queue[screen->reims_rb_head].h;
++        started_ns = screen->reims_rb_queue[screen->reims_rb_head].started_ns;
++        alloc_ns = screen->reims_rb_queue[screen->reims_rb_head].alloc_ns;
++        encode_ns = screen->reims_rb_queue[screen->reims_rb_head].encode_ns;
++        screen->reims_rb_head = (screen->reims_rb_head + 1) & 1;
++        screen->reims_rb_count--;
++        qemu_mutex_unlock(&screen->reims_rb_lock);
++
++        t2 = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
++        status = rvg_frame_wait(frame);
++        t3 = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
++        if (!status && !qatomic_read(&vms->reims_stopping)) {
++            if (screen->reims_pixels_size != (size_t)w * h * 4) {
++                screen->reims_pixels = g_realloc(screen->reims_pixels,
++                                                 (size_t)w * h * 4);
++                screen->reims_prev_pixels = g_realloc(screen->reims_prev_pixels,
++                                                      (size_t)w * h * 4);
++                screen->reims_pixels_size = (size_t)w * h * 4;
++                screen->reims_prev_valid = false;
++            }
++            status = rvg_frame_target_read_pixels(screen->reims_targets[slot],
++                                                  screen->reims_pixels, w * 4,
++                                                  (size_t)w * h * 4);
++        }
++        t4 = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
++        rvg_frame_release(frame);
++
++        if (!status && !qatomic_read(&vms->reims_stopping)) {
++            reims_readback_publish(screen, w, h, started_ns, alloc_ns,
++                                   encode_ns, t3 - t2, t4 - t3);
++        } else if (status) {
++            error_report("Reims screen=%u frame: %s",
++                         screen->index, rvg_status_message(status));
++            trace_vmapple_reims_frame_end(screen->index, started_ns, "failed");
++        } else {
++            trace_vmapple_reims_frame_end(screen->index, started_ns, "suppressed");
++        }
++
++        qemu_mutex_lock(&screen->reims_rb_lock);
++        if (status && screen->reims_targets[slot]) {
++            rvg_frame_target_release(screen->reims_targets[slot]);
++            screen->reims_targets[slot] = NULL;
++            screen->reims_target_widths[slot] = 0;
++            screen->reims_target_heights[slot] = 0;
++        }
++        screen->reims_rb_slot_busy[slot] = false;
++        qemu_cond_broadcast(&screen->reims_rb_cond);
++        qemu_mutex_unlock(&screen->reims_rb_lock);
++    }
++    return NULL;
++}
++
++static void reims_frame(void *opaque)
++{
++    VMAppleReimsScreen *screen = opaque;
++    VMAppleMachineState *vms = screen->machine;
++    unsigned w = screen->reims_width, h = screen->reims_height;
++    int64_t started_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
++    int64_t t0, t1, t2;
++    unsigned slot;
++    RvgFrameTarget *target = NULL;
++    RvgFrame *frame = NULL;
++    RvgFrameTargetConfig cfg = {
++        .struct_size = sizeof(cfg), .width = w, .height = h,
++        .format = RVG_PIXEL_FORMAT_BGRA8_UNORM,
++    };
++    RvgStatus status;
++
++    trace_vmapple_reims_frame_begin(screen->index, started_ns);
++    if (qatomic_read(&vms->reims_stopping) || !w || !h) {
++        trace_vmapple_reims_frame_end(screen->index, started_ns, "skipped");
++        return;
++    }
++
++    qemu_mutex_lock(&screen->reims_rb_lock);
++    while ((screen->reims_rb_count == 2 ||
++            screen->reims_rb_slot_busy[screen->reims_target_next]) &&
++           !screen->reims_rb_stop && !qatomic_read(&vms->reims_stopping)) {
++        qemu_cond_wait(&screen->reims_rb_cond, &screen->reims_rb_lock);
++    }
++    if (screen->reims_rb_stop || qatomic_read(&vms->reims_stopping)) {
++        qemu_mutex_unlock(&screen->reims_rb_lock);
++        trace_vmapple_reims_frame_end(screen->index, started_ns, "skipped");
++        return;
++    }
++    slot = screen->reims_target_next;
++    screen->reims_rb_slot_busy[slot] = true;
++    screen->reims_target_next = slot ^ 1;
++    qemu_mutex_unlock(&screen->reims_rb_lock);
++
++    t0 = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
++    if (!screen->reims_targets[slot] ||
++        screen->reims_target_widths[slot] != w ||
++        screen->reims_target_heights[slot] != h) {
++        if (screen->reims_targets[slot]) {
++            rvg_frame_target_release(screen->reims_targets[slot]);
++            screen->reims_targets[slot] = NULL;
++            screen->reims_target_widths[slot] = 0;
++            screen->reims_target_heights[slot] = 0;
++        }
++        status = rvg_frame_target_create(vms->reims_device, &cfg, &target);
++        if (!status) {
++            screen->reims_targets[slot] = target;
++            screen->reims_target_widths[slot] = w;
++            screen->reims_target_heights[slot] = h;
++        }
++    } else {
++        target = screen->reims_targets[slot];
++        status = RVG_OK;
++    }
++    t1 = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
++    if (!status) {
++        status = rvg_display_encode_frame(screen->reims_display, target, NULL, &frame);
++    }
++    if (!status) {
++        status = rvg_frame_commit(frame);
++    }
++    t2 = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
++
++    if (status) {
++        if (frame) {
++            rvg_frame_release(frame);
++        }
++        if (screen->reims_targets[slot]) {
++            rvg_frame_target_release(screen->reims_targets[slot]);
++            screen->reims_targets[slot] = NULL;
++            screen->reims_target_widths[slot] = 0;
++            screen->reims_target_heights[slot] = 0;
++        }
++        qemu_mutex_lock(&screen->reims_rb_lock);
++        screen->reims_rb_slot_busy[slot] = false;
++        qemu_cond_broadcast(&screen->reims_rb_cond);
++        qemu_mutex_unlock(&screen->reims_rb_lock);
++        error_report("Reims screen=%u frame: %s",
++                     screen->index, rvg_status_message(status));
++        trace_vmapple_reims_frame_end(screen->index, started_ns, "failed");
++        return;
++    }
++
++    qemu_mutex_lock(&screen->reims_rb_lock);
++    screen->reims_rb_queue[screen->reims_rb_tail].slot = slot;
++    screen->reims_rb_queue[screen->reims_rb_tail].frame = frame;
++    screen->reims_rb_queue[screen->reims_rb_tail].w = w;
++    screen->reims_rb_queue[screen->reims_rb_tail].h = h;
++    screen->reims_rb_queue[screen->reims_rb_tail].started_ns = started_ns;
++    screen->reims_rb_queue[screen->reims_rb_tail].alloc_ns = t1 - t0;
++    screen->reims_rb_queue[screen->reims_rb_tail].encode_ns = t2 - t1;
++    screen->reims_rb_tail = (screen->reims_rb_tail + 1) & 1;
++    screen->reims_rb_count++;
++    qemu_cond_broadcast(&screen->reims_rb_cond);
++    qemu_mutex_unlock(&screen->reims_rb_lock);
++}
++/* Like mode/frame, these run on the library's serial display worker. */
++static void reims_cursor_move(void *opaque)
++{
++    VMAppleReimsScreen *screen = opaque;
++    VMAppleMachineState *vms = screen->machine;
++    RvgDisplayCoord pos = rvg_display_cursor_position(screen->reims_display);
++    bql_lock();
++    if (!qatomic_read(&vms->reims_stopping)) {
++        qemu_console_set_mouse(screen->reims_console, pos.x, pos.y,
++                               screen->reims_cursor_show);
++        if (screen->reims_cursor_events++ < 16) {
++            info_report("Reims screen=%u cursor position %u,%u visible=%u"
++                        " host-ms=%" PRId64, screen->index, pos.x, pos.y,
++                        screen->reims_cursor_show,
++                        qemu_clock_get_ms(QEMU_CLOCK_HOST));
++        }
++    }
++    bql_unlock();
++}
++
++static void reims_cursor_show(void *opaque, uint8_t show)
++{
++    VMAppleReimsScreen *screen = opaque;
++    screen->reims_cursor_show = show != 0;
++    reims_cursor_move(opaque);
++}
++
++static void reims_cursor_glyph(void *opaque, const RvgCursorGlyph *glyph)
++{
++    VMAppleReimsScreen *screen = opaque;
++    VMAppleMachineState *vms = screen->machine;
++    QEMUCursor *cursor;
++    int64_t queued_ns, acquired_ns, released_ns;
++    size_t i, count = (size_t)glyph->width * glyph->height;
++    if (qatomic_read(&vms->reims_stopping) || !glyph->width ||
++        !glyph->height || glyph->width > 256 || glyph->height > 256 ||
++        !glyph->rgba || glyph->rgba_length < count * 4) {
++        return;
++    }
++    cursor = cursor_alloc(glyph->width, glyph->height);
++    cursor->hot_x = MIN(glyph->hot_spot.x, glyph->width - 1);
++    cursor->hot_y = MIN(glyph->hot_spot.y, glyph->height - 1);
++    for (i = 0; i < count; i++) {
++        const uint8_t *px = glyph->rgba + i * 4;
++        cursor->data[i] = ((uint32_t)px[0] << 16) | ((uint32_t)px[1] << 8) |
++                          px[2] | ((uint32_t)px[3] << 24);
++    }
++    queued_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
++    bql_lock();
++    acquired_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
++    if (!qatomic_read(&vms->reims_stopping)) {
++        if (screen->reims_cursor) {
++            cursor_unref(screen->reims_cursor);
++        }
++        screen->reims_cursor = cursor;
++        qemu_console_set_cursor(screen->reims_console, cursor);
++        info_report("Reims cursor glyph %ux%u", glyph->width, glyph->height);
++    } else {
++        cursor_unref(cursor);
++    }
++    released_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
++    screen->reims_glyph_count++;
++    screen->reims_glyph_wait_max_ns = MAX(screen->reims_glyph_wait_max_ns,
++                                      acquired_ns - queued_ns);
++    screen->reims_glyph_hold_max_ns = MAX(screen->reims_glyph_hold_max_ns,
++                                      released_ns - acquired_ns);
++    bql_unlock();
++    /* This serial worker alone writes these counters; log outside BQL. */
++    if ((screen->reims_glyph_count & (screen->reims_glyph_count - 1)) == 0) {
++        info_report("Reims glyph stats count=%" PRIu64
++                    " wait_max_ns=%" PRIu64 " hold_max_ns=%" PRIu64,
++                    screen->reims_glyph_count, screen->reims_glyph_wait_max_ns,
++                    screen->reims_glyph_hold_max_ns);
++    }
++}
++
++static char *reims_frame_snapshot(Object *obj, Error **errp)
++{
++    VMAppleMachineState *vms = VMAPPLE_MACHINE(obj);
++    GString *out = g_string_new("[");
++    for (unsigned i = 0; i < vms->reims_active_screens; i++) {
++        VMAppleReimsScreen *screen = &vms->reims_screens[i];
++        g_string_append_printf(out,
++            "%s{\"screen\":%u,\"count\":%" PRIu64
++            ",\"host_ns\":%" PRId64 ",\"cumulative_ns\":[",
++            i ? "," : "", i, screen->reims_snapshot_count,
++            screen->reims_snapshot_host_ns);
++        for (unsigned stage = 0; stage < 5; stage++) {
++            g_string_append_printf(out, "%s%" PRIu64, stage ? "," : "",
++                                   screen->reims_snapshot_stage_ns[stage]);
++        }
++        g_string_append_c(out, ']');
++        /* QOM reads hold BQL. Teardown sets stopping before releasing it. */
++        if (!qatomic_read(&vms->reims_stopping) && screen->reims_display) {
++            uint64_t guest, host;
++
++            rvg_display_present_counts(screen->reims_display, &guest, &host);
++            g_string_append_printf(out, ",\"guest_present\":%" PRIu64
++                                   ",\"host_encode\":%" PRIu64, guest, host);
++        }
++        g_string_append_c(out, '}');
++    }
++    g_string_append(out, "]");
++    return g_string_free(out, false);
++}
++
++static const GraphicHwOps reims_console_ops = { 0 };
++
++
++static void reims_console_create_one(VMAppleMachineState *vms, unsigned index)
++{
++    VMAppleReimsScreen *screen = &vms->reims_screens[index];
++
++    screen->machine = vms;
++    screen->index = index;
++    qemu_event_init(&screen->reims_display_done, false);
++    qemu_mutex_init(&screen->reims_rb_lock);
++    qemu_cond_init(&screen->reims_rb_cond);
++    screen->reims_rb_started = true;
++    qemu_thread_create(&screen->reims_rb_thread, "reims-readback",
++                       reims_readback_thread, screen, QEMU_THREAD_JOINABLE);
++    screen->reims_console = qemu_graphic_console_create(NULL, index,
++                                                        &reims_console_ops, screen);
++}
++
++/*
++ * VNC and other display listeners bind to a console at display-init time, which
++ * runs before the guest first touches the GPU.  Create the consoles during
++ * machine init so the serialized frame callbacks reach a bound listener.
++ */
++static void reims_console_preinit(VMAppleMachineState *vms)
++{
++    for (unsigned i = 0; i < vms->reims_display_count &&
++                         i < RVG_MAX_DISPLAY_PORTS; i++) {
++        if (!vms->reims_screens[i].reims_console) {
++            reims_console_create_one(vms, i);
++        }
++    }
++}
++static void reims_exit(Notifier *notifier, void *data)
++{
++    VMAppleMachineState *vms = container_of(notifier, VMAppleMachineState, reims_exit);
++    if (qatomic_read(&vms->reims_stopping)) {
++        return;
++    }
++    qatomic_set(&vms->reims_stopping, true);
++    /* Normal cleanup holds BQL; display callbacks may need it to drain. */
++    bql_unlock();
++    for (unsigned i = 0; i < vms->reims_active_screens; i++) {
++        rvg_display_release(vms->reims_screens[i].reims_display);
++    }
++    for (unsigned i = 0; i < vms->reims_active_screens; i++) {
++        VMAppleReimsScreen *screen = &vms->reims_screens[i];
++        qemu_event_wait(&screen->reims_display_done);
++        if (screen->reims_rb_started) {
++            qemu_mutex_lock(&screen->reims_rb_lock);
++            screen->reims_rb_stop = true;
++            qemu_cond_broadcast(&screen->reims_rb_cond);
++            qemu_mutex_unlock(&screen->reims_rb_lock);
++            qemu_thread_join(&screen->reims_rb_thread);
++            screen->reims_rb_started = false;
++            qemu_cond_destroy(&screen->reims_rb_cond);
++            qemu_mutex_destroy(&screen->reims_rb_lock);
++        }
++        for (unsigned j = 0; j < 2; j++) {
++            if (screen->reims_targets[j]) {
++                rvg_frame_target_release(screen->reims_targets[j]);
++                screen->reims_targets[j] = NULL;
++                screen->reims_target_widths[j] = 0;
++                screen->reims_target_heights[j] = 0;
++            }
++        }
++        g_clear_pointer(&screen->reims_pixels, g_free);
++        g_clear_pointer(&screen->reims_prev_pixels, g_free);
++        screen->reims_pixels_size = 0;
++        screen->reims_prev_valid = false;
++    }
++    rvg_device_release(vms->reims_device);
++    qemu_event_wait(&vms->reims_device_done);
++    rvg_iosurface_device_release(vms->reims_surface);
++    qemu_event_wait(&vms->reims_surface_done);
++    /* Optional additive API: old libraries retain their historical cleanup path. */
++    uint32_t (*terminal_shutdown)(void) = dlsym(RTLD_DEFAULT, "rvg_terminal_shutdown");
++    uint32_t (*terminal_wait)(uint64_t) =
++        dlsym(RTLD_DEFAULT, "rvg_terminal_shutdown_wait");
++    if (terminal_wait || terminal_shutdown) {
++        uint32_t terminal = terminal_wait
++            ? terminal_wait(vms->reims_terminal_wait_ns) : terminal_shutdown();
++        /* Terminal results are not RvgStatus: calling status_message is now illegal. */
++        if (terminal != 0) {
++            error_report("Reims terminal backend shutdown incomplete: result=%u", terminal);
++            exit(EXIT_FAILURE);
++        }
++        info_report("Reims terminal backend shutdown complete");
++    } else {
++        info_report("Reims library has no explicit terminal shutdown API");
++    }
++    bql_lock();
++    for (unsigned i = 0; i < vms->reims_active_screens; i++) {
++        VMAppleReimsScreen *screen = &vms->reims_screens[i];
++        if (screen->reims_cursor) {
++            cursor_unref(screen->reims_cursor);
++            screen->reims_cursor = NULL;
++        }
++        qemu_event_destroy(&screen->reims_display_done);
++    }
++    qemu_bh_delete(vms->reims_bh);
++    qemu_event_destroy(&vms->reims_device_done);
++    qemu_event_destroy(&vms->reims_surface_done);
++    info_report("Reims callbacks drained and backend released");
++}
++
++#include "reims-display-mode.h"
++
++static void reims_init(VMAppleMachineState *vms)
++{
++    MachineState *machine = MACHINE(vms);
++    VmappleRamSpan deny[9], spans[10];
++    RvgMemoryRange ranges[10];
++    RvgMemoryRangeFile files[10];
++    uint64_t base = vms->memmap[VMAPPLE_MEM].base;
++    size_t denied = 0, count;
++    int fd = memory_region_get_fd(machine->ram);
++    if (vms->diagnostic_ro_size) {
++        deny[denied++] = (VmappleRamSpan){vms->diagnostic_ro_start,
++                                       vms->diagnostic_ro_size};
++    }
++    for (unsigned i = 0; i < 8; i++) {
++        uint64_t *r = vms->diagnostic_bank_regs[i];
++        if (r[2] == 7) {
++            uint64_t end = r[1] + (vms->diagnostic_bank_page_upper ? 0x4000 : 1);
++            deny[denied++] = (VmappleRamSpan){r[0], end - r[0]};
++        }
++    }
++    count = vmapple_ram_complement(base, machine->ram_size, deny, denied,
++                                   spans, ARRAY_SIZE(spans));
++    if (count == SIZE_MAX || count == 0) {
++        error_report("Reims protected RAM complement invalid or empty");
++        exit(EXIT_FAILURE);
++    }
++    for (size_t i = 0; i < count; i++) {
++        uint64_t offset = spans[i].start - base;
++        void *host = (uint8_t *)memory_region_get_ram_ptr(machine->ram) + offset;
++        if (vms->recovery_protection) {
++            /* The isolated service requires whole 16 KiB host pages. QEMU's
++             * memfd RAM may be only host-page aligned. Reserve then map ONLY
++             * this writable span; no alias of an excluded page is constructed.
++             * These views live until process exit, like the frozen device. */
++            size_t reserve_size = spans[i].length + 0x4000;
++            void *reservation = mmap(NULL, reserve_size, PROT_NONE,
++                                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++            if (reservation == MAP_FAILED) {
++                error_report("Reims aligned span reservation: %s", strerror(errno));
++                exit(EXIT_FAILURE);
++            }
++            uintptr_t aligned = ((uintptr_t)reservation + 0x3fff) & ~(uintptr_t)0x3fff;
++            size_t prefix = aligned - (uintptr_t)reservation;
++            size_t suffix = reserve_size - prefix - spans[i].length;
++            if (prefix) { munmap(reservation, prefix); }
++            if (suffix) { munmap((void *)(aligned + spans[i].length), suffix); }
++            host = mmap((void *)aligned, spans[i].length, PROT_READ | PROT_WRITE,
++                        MAP_SHARED | MAP_FIXED, fd,
++                        qemu_ram_get_fd_offset(machine->ram->ram_block) + offset);
++            if (host == MAP_FAILED) {
++                error_report("Reims aligned span mapping: %s", strerror(errno));
++                exit(EXIT_FAILURE);
++            }
++        }
++        ranges[i] = (RvgMemoryRange){
++            .physical_address = spans[i].start, .physical_length = spans[i].length,
++            .host_address = host,
++        };
++        files[i] = (RvgMemoryRangeFile){.fd = fd,
++            .offset = qemu_ram_get_fd_offset(machine->ram->ram_block) + offset};
++    }
++    RvgMemoryMap map = {.ranges = ranges, .range_count = count};
++    vms->reims_map_frozen = true;
++    info_report("Reims RAM map: %zu writable spans, %zu protected exclusions", count, denied);
++    RvgIOSurfaceCallbacks icb = {
++        .struct_size = sizeof(icb), .ctx = vms,
++        .raise_interrupt = reims_surface_irq, .destroy = reims_surface_destroy,
++    };
++    RvgIOSurfaceDeviceConfig isc = {
++        .struct_size = sizeof(isc), .memory_map = &map, .callbacks = &icb,
++    };
++    RvgHostCallbacks cb = {
++        .struct_size = sizeof(cb), .ctx = vms, .raise_interrupt = reims_gpu_irq,
++        .destroy = reims_device_destroy,
++    };
++    RvgDeviceConfig config = {
++        .struct_size = sizeof(config), .display_port_count = vms->reims_display_count,
++        .memory_map = &map, .memory_files = files, .callbacks = &cb,
++        .use_iosurface_mapper = true,
++        /* Modern guests request task address spaces beyond the local limit. */
++        .process_isolation = vms->recovery_protection,
++    };
++    RvgDisplayCallbacks dcb = {
++        .struct_size = sizeof(dcb), .ctx = NULL,
++        .mode_change = reims_mode, .new_frame = reims_frame,
++        .cursor_glyph = reims_cursor_glyph, .cursor_show = reims_cursor_show,
++        .cursor_move = reims_cursor_move,
++        .destroy = reims_display_destroy,
++    };
++    RvgDisplayConfig display = {
++        /* Keep the old ABI size unless identity is explicitly requested. */
++        .struct_size = 64, .serial_number = 1,
++        .width_millimeters = 300, .height_millimeters = 220, .callbacks = &dcb,
++    };
++    RvgDisplayMode mode;
++
++    if (vms->reims_display_count < 1 ||
++        vms->reims_display_count > RVG_MAX_DISPLAY_PORTS) {
++        error_report("Reims display count requires 1..%u", RVG_MAX_DISPLAY_PORTS);
++        exit(EXIT_FAILURE);
++    }
++    if (!vmapple_reims_mode_valid(vms->reims_mode_width,
++                                  vms->reims_mode_height,
++                                  vms->reims_mode_refresh_hz)) {
++        error_report("Reims mode requires width/height 1..4096 and refresh 1..UINT32_MAX Hz");
++        exit(EXIT_FAILURE);
++    }
++    mode = (RvgDisplayMode){
++        .width = vms->reims_mode_width,
++        .height = vms->reims_mode_height,
++        .refresh_rate_hz = vms->reims_mode_refresh_hz,
++    };
++    if (fd < 0) {
++        error_report("Reims requires shared memfd RAM (memory-backend-memfd,share=on)");
++        exit(EXIT_FAILURE);
++    }
++    vms->reims_active_screens = vms->reims_display_count;
++    rvg_log_set_handler(reims_log, NULL,
++                        g_strcmp0(g_getenv("QEMU_REIMS_TRACE_PRESENT"), "1") == 0
++                        ? RVG_LOG_TRACE : RVG_LOG_WARN);
++    qemu_event_init(&vms->reims_device_done, false);
++    qemu_event_init(&vms->reims_surface_done, false);
++    vms->reims_bh = qemu_bh_new(reims_irq_bh, vms);
++    reims_require(rvg_iosurface_device_create(&isc, &vms->reims_surface), "IOSurface");
++    reims_require(rvg_device_create(&config, &vms->reims_device), "device");
++    for (unsigned i = 0; i < vms->reims_active_screens; i++) {
++        VMAppleReimsScreen *screen = &vms->reims_screens[i];
++        if (!screen->reims_console) {
++            reims_console_create_one(vms, i);
++        }
++        dcb.ctx = screen;
++        display.serial_number = i + 1;
++        display.port = i;
++        struct {
++            RvgDisplayConfig config;
++            uint8_t uuid[16];
++        } identity = { .config = display };
++        _Static_assert(sizeof(RvgDisplayConfig) == 64, "pinned display ABI");
++        if (reims_display_identity(vms->reims_display_identity_seed, i,
++                                   identity.uuid)) {
++            identity.config.struct_size = sizeof(identity);
++        }
++        reims_require(rvg_display_create(vms->reims_device, &identity.config,
++                                        &screen->reims_display), "display");
++        rvg_display_set_modes(screen->reims_display, &mode, 1);
++    }
++    vms->reims_exit.notify = reims_exit;
++    /* libc exit runs after main-thread TLS destructors on Linux. */
++    qemu_add_cleanup_notifier(&vms->reims_exit);
++    info_report("Reims backend initialized with serialized frame readback");
++}
++#endif
+diff --git a/hw/vmapple/trace-events b/hw/vmapple/trace-events
+index b91c8832..b7bd37c9 100644
+--- a/hw/vmapple/trace-events
++++ b/hw/vmapple/trace-events
+@@ -1,6 +1,84 @@
+ # See docs/devel/tracing.rst for syntax documentation.
+ # SPDX-License-Identifier: GPL-2.0-or-later
+ 
++# vmapple.c
++# Power-of-two BH samples and per-register summaries, not a complete timeline.
++vmapple_reims_status_summary(int64_t host_ms, uint64_t offset, unsigned count, unsigned nonzero) "host_ms=%"PRId64" offset=0x%"PRIx64" count=%u nonzero=%u"
++# offset 0: BH pending mask before delivery; otherwise original status-read result.
++vmapple_reims_irq_status(int64_t host_ms, uint64_t offset, uint32_t value, unsigned count) "host_ms=%"PRId64" offset=0x%"PRIx64" value=0x%"PRIx32" count=%u"
++vmapple_gfx_probe(unsigned window, bool write, uint64_t offset, unsigned size, uint64_t value) "window=%u write=%d offset=0x%"PRIx64" size=%u value=0x%"PRIx64
++
++vmapple_gfx_fifo_probe(uint32_t producer, uint32_t word0, uint32_t word1, uint32_t word2) "producer=%u header=%08x,%08x,%08x"
++
++vmapple_gfx_payload_probe(uint16_t opcode, uint32_t offset, uint32_t value) "opcode=%u payload_offset=%u value=%08x"
++
++vmapple_gfx_channel_probe(uint32_t id, uint32_t read, uint32_t write, uint32_t state, uint32_t flags, uint32_t page) "id=%u read=%u write=%u state=%08x flags=%08x page=%08x"
++
++vmapple_gfx_channel_register(uint32_t id, bool registered) "id=%u registered=%d"
++
++vmapple_gfx_channel_mapping(uint32_t id, bool mapped) "id=%u first_page_valid=%d"
++
++vmapple_gfx_query_pending(bool valid) "destination_valid=%d pending_without_completion=1"
++
++vmapple_gfx_response_write(bool saved, bool verified) "original_saved=%d full_readback_verified=%d completion_sent=0"
++
++vmapple_gfx_address_space(bool valid) "descriptor_registered=%d translation_implemented=0 completion_sent=0"
++
++vmapple_gfx_heap(bool valid) "relationship_registered=%d translation_status_in_mapping_event=1 completion_sent=0"
++
++vmapple_gfx_heap_mapping(bool mapped) "all_heap_pages_ram_valid=%d completion_sent=0"
++
++vmapple_gfx_walk_stage(unsigned stage, uint64_t offset) "failure_stage=%u heap_offset=0x%"PRIx64
++vmapple_gfx_walk_descriptor(uint32_t page, uint32_t levels) "page=%08x levels=%u"
++vmapple_gfx_walk_entry(unsigned read, uint64_t address, uint32_t entry) "read=%u address=0x%"PRIx64" entry=%08x"
++
++vmapple_iosfc_record(uint64_t producer, uint32_t operation, uint32_t mapping) "producer=%"PRIu64" first_operation=%u first_mapping=%u completion_sent=0"
++
++vmapple_iosfc_mapping(bool valid) "host_descriptor_registered=%d completion_sent=0"
++
++vmapple_gfx_root_candidate(bool ready, bool failed) "handled_prefix_ready=%d prefix_failed=%d"
++
++vmapple_gfx_root_complete(bool saved, bool verified, uint32_t consumer) "original_saved=%d stamp_readback_verified=%d consumer=%u"
++
++vmapple_gfx_stamp_status(uint32_t status) "read_clear_stamp_mask=%08x"
++vmapple_gfx_root_wake(void) "verified_root_stamp_mask=1 gpu_irq_pulsed=1"
++
++vmapple_gfx_channel_header(uint32_t id, uint32_t producer, uint32_t consumer, uint32_t a, uint32_t b, uint32_t c) "id=%u producer=%u consumer=%u header=%08x,%08x,%08x completion_sent=0"
++
++vmapple_gfx_channel_payload(uint32_t id, uint16_t opcode, uint32_t offset, uint32_t value) "id=%u opcode=%u payload_offset=%u value=%08x"
++
++vmapple_gfx_display_state(bool registered) "display_id=0 shared_state_registered=%d completion_sent=0"
++
++vmapple_gfx_display_complete(void) "display_id=0 state_verified=1 consumer=20 stamp_slot=4 stamp=256 features_unchanged=1"
++
++vmapple_gfx_display_revision(uint32_t revision) "display=0 revision=%u consumer=40 stamp=512 verified=1"
++vmapple_gfx_display_event(void) "display=0 event=4 enabled=1 pending_verified=1 mmio_event_mask=1 scanout=0"
++vmapple_gfx_display_mode(void) "count=1 width=1024 height=768 refresh_16_16=3932160 verified=1 connection_unchanged=1 scanout=0"
++vmapple_gfx_texture_submission(unsigned offset, uint32_t value) "offset=%u value=%08x read_only=1 completion_sent=0"
++
++vmapple_gfx_submission_generation(uint32_t task, uint32_t generation, uint32_t dependency) "task=%u generation=%u dependency=%u gate_passed=1 completion_sent=0"
++
++vmapple_gfx_lifecycle(uint16_t opcode, uint32_t consumer, uint32_t tag) "opcode=%u consumer=%u stamp=%u ordered=1"
++
++vmapple_gfx_task_prefix(uint32_t task) "task=%u consumer=52 stamp=512 stops_before_opcode37=1"
++
++vmapple_gfx_fill_complete(bool completed, uint64_t size) "completed=%d size=%"PRIu64" dependency_checked=1 effect_verified=1"
++
++vmapple_gfx_fill_effect(bool verified, uint64_t size) "diagnostic_only=1 verified=%d size=%"PRIu64" dependency_scheduling=0 completion_sent=0"
++
++vmapple_gfx_resource_word(unsigned kind, uint32_t offset, uint32_t value) "kind=%u offset=%u value=%08x read_only=1"
++
++vmapple_gfx_segment_result(unsigned stage) "read_only=1 failure_stage=%u completion_sent=0"
++vmapple_gfx_segment_word(uint32_t offset, uint32_t value) "offset=%u value=%08x"
++
++vmapple_gfx_submission_word(uint32_t offset, uint32_t value) "channel=1 opcode=55 command_offset=%u value=%08x completion_sent=0"
++
++vmapple_gfx_task_registration(uint16_t opcode, bool valid) "channel=2 opcode=%u registered=%d completion_sent=0"
++
++# reims.inc.c
++vmapple_reims_frame_begin(unsigned screen, int64_t host_ns) "screen=%u host_ns=%"PRId64
++vmapple_reims_frame_end(unsigned screen, int64_t started_ns, const char *outcome) "screen=%u started_ns=%"PRId64" outcome=%s"
++
+ # aes.c
+ aes_read(uint64_t offset, uint64_t res) "offset=0x%"PRIx64" res=0x%"PRIx64
+ aes_cmd_key_select_builtin(uint32_t ctx, uint32_t key_id, const char *direction, const char *cipher) "[%d] Selecting builtin key %d to %scrypt with %s"
+@@ -16,7 +94,7 @@ aes_2_write(uint64_t offset, uint64_t val) "offset=0x%"PRIx64" val=0x%"PRIx64
+ aes_dump_data(const char *desc, const char *hex) "%s%s"
+ 
+ # bdif.c
++bdif_recovery_probe(const char *event, uint32_t queue, uint32_t len, uint32_t flags) "event=%s queue=%u len=%u flags=%u"
+ bdif_read(uint64_t offset, uint32_t size, uint64_t value) "offset=0x%"PRIx64" size=0x%x value=0x%"PRIx64
+ bdif_write(uint64_t offset, uint32_t size, uint64_t value) "offset=0x%"PRIx64" size=0x%x value=0x%"PRIx64
+ bdif_vblk_read(const char *dev, uint64_t addr, uint64_t offset, uint32_t len, int r) "dev=%s addr=0x%"PRIx64" off=0x%"PRIx64" size=0x%x r=%d"
+-bdif_recovery_probe(const char *event, uint32_t queue, uint32_t len, uint32_t flags) "event=%s queue=%u len=%u flags=%u"
+diff --git a/hw/vmapple/vmapple.c b/hw/vmapple/vmapple.c
+index 616df42c..ff2e3093 100644
+--- a/hw/vmapple/vmapple.c
++++ b/hw/vmapple/vmapple.c
+@@ -15,7 +15,6 @@
+  */
+ 
+ #include "qemu/osdep.h"
+-#include "migration/blocker.h"
+ #include "qemu/bitops.h"
+ #include "qemu/datadir.h"
+ #include "qemu/error-report.h"
+@@ -27,6 +26,7 @@
+ #include "qemu/timer.h"
+ #include "qemu/units.h"
+ #include "exec/icount.h"
++#include "system/address-spaces.h"
+ #include "monitor/qdev.h"
+ #include "hw/core/boards.h"
+ #include "hw/core/irq.h"
+@@ -44,7 +44,9 @@
+ #include "hw/usb/hcd-xhci-pci.h"
+ #include "hw/virtio/virtio-pci.h"
+ #include "hw/vmapple/vmapple.h"
++#include "hw/vmapple/gfx-probe.h"
+ #include "net/net.h"
++#include "migration/blocker.h"
+ #include "qapi/error.h"
+ #include "qapi/visitor.h"
+ #include "qapi/qapi-visit-common.h"
+@@ -56,8 +58,67 @@
+ #include "system/tcg.h"
+ #include "target/arm/gtimer.h"
+ #include "target/arm/cpu.h"
++#include "trace.h"
+ #include "target/arm/cpu-features.h"
+ 
++#ifdef CONFIG_VMAPPLE_REIMS
++#include <reims_vgpu.h>
++#include <sys/mman.h>
++#include <dlfcn.h>
++#include "reims-memory-ranges.h"
++#include "reims-display-identity.h"
++#include "system/ramblock.h"
++#include "ui/console.h"
++#include "ui/surface.h"
++#include "system/system.h"
++#endif
++
++#ifdef CONFIG_VMAPPLE_REIMS
++typedef struct VMAppleReimsScreen {
++    struct VMAppleMachineState *machine;
++    unsigned index;
++    RvgDisplay *reims_display;
++    QemuConsole *reims_console;
++    unsigned reims_width, reims_height;
++    RvgFrameTarget *reims_targets[2];
++    unsigned reims_target_widths[2], reims_target_heights[2];
++    unsigned reims_target_next;
++    QemuThread reims_rb_thread;
++    QemuMutex reims_rb_lock;
++    QemuCond reims_rb_cond;
++    bool reims_rb_started;
++    bool reims_rb_stop;
++    bool reims_rb_slot_busy[2];
++    struct {
++        unsigned slot;
++        RvgFrame *frame;
++        unsigned w, h;
++        int64_t started_ns;
++        int64_t alloc_ns;
++        int64_t encode_ns;
++    } reims_rb_queue[2];
++    unsigned reims_rb_head, reims_rb_tail, reims_rb_count;
++    uint8_t *reims_pixels;
++    uint8_t *reims_prev_pixels;
++    size_t reims_pixels_size;
++    unsigned reims_prev_width, reims_prev_height;
++    bool reims_prev_valid;
++    bool reims_cursor_show;
++    QEMUCursor *reims_cursor;
++    uint64_t reims_frames;
++    uint64_t reims_frame_max_ns;
++    uint64_t reims_stage_ns[5];
++    /* BQL-protected observation of fully accounted successful frames. */
++    uint64_t reims_snapshot_count, reims_snapshot_stage_ns[5];
++    int64_t reims_snapshot_host_ns;
++    uint64_t reims_glyph_count;
++    uint64_t reims_glyph_wait_max_ns;
++    uint64_t reims_glyph_hold_max_ns;
++    unsigned reims_cursor_events;
++    QemuEvent reims_display_done;
++} VMAppleReimsScreen;
++#endif
++
+ struct VMAppleMachineState {
+     MachineState parent;
+ 
+@@ -77,6 +138,11 @@ struct VMAppleMachineState {
+     bool recovery_rtc_selector;
+     uint64_t recovery_platform_control;
+     uint64_t recovery_platform_mask;
++    MemoryRegion diagnostic_ro_mr;
++    uint64_t diagnostic_ro_start, diagnostic_ro_size;
++    bool diagnostic_ro_initialized;
++    bool diagnostic_range_banks;
++    bool diagnostic_bank_page_upper;
+     bool recovery_protection;
+     Error *diagnostic_protection_migration_blocker;
+     MemoryRegion diagnostic_bank_mr;
+@@ -84,7 +150,92 @@ struct VMAppleMachineState {
+     MemoryRegion diagnostic_bank_views[8];
+     MemoryRegion ecam_alias;
+ #ifndef CONFIG_MAC_PVG_MMIO
++    uint64_t gfx_reims;
++    uint64_t reims_mode_width, reims_mode_height, reims_mode_refresh_hz;
++    uint64_t reims_display_count;
++    uint64_t reims_terminal_wait_ns;
++    uint64_t reims_display_identity_seed;
++#ifdef CONFIG_VMAPPLE_REIMS
++    RvgDevice *reims_device;
++    RvgIOSurfaceDevice *reims_surface;
++    QEMUBH *reims_bh;
++    unsigned reims_pending;
++    unsigned reims_irq_trace_count;
++    unsigned reims_status_trace_count[3], reims_status_nonzero_count[3];
++    bool reims_stopping;
++    bool reims_map_frozen;
++    VMAppleReimsScreen reims_screens[RVG_MAX_DISPLAY_PORTS];
++    unsigned reims_active_screens;
++    Notifier reims_exit;
++    QemuEvent reims_device_done, reims_surface_done;
++#endif
+     MemoryRegion gfx_stub_mr;
++    unsigned gfx_probe_count[2];
++    uint64_t gfx_probe_readback;
++    uint64_t gfx_probe_root_wake;
++    uint32_t gfx_probe_stamp_pending;
++    unsigned gfx_probe_doorbells[8];
++    uint32_t gfx_probe_last_producer[8];
++    uint32_t gfx_probe_last_consumer[8];
++    uint64_t gfx_probe_display_complete;
++    uint64_t gfx_probe_display_mode;
++    uint64_t gfx_probe_task_lifecycle;
++    VMAppleGfxLifecycle gfx_probe_lifecycle;
++    uint32_t gfx_probe_lifecycle_cursor, gfx_probe_lifecycle_tag;
++    bool gfx_probe_lifecycle_poisoned;
++    uint64_t gfx_probe_task_prefix;
++    bool gfx_probe_task_prefix_saved;
++    uint8_t gfx_probe_task_prefix_original[8];
++    uint64_t gfx_probe_fill_complete;
++    uint64_t gfx_probe_fill_control;
++    uint32_t gfx_probe_fill_command_length;
++    uint32_t gfx_probe_fill_cursor, gfx_probe_fill_tag;
++    bool gfx_probe_fill_poisoned;
++    uint64_t gfx_probe_fill_effect;
++    bool gfx_probe_fill_effect_saved;
++    uint8_t gfx_probe_fill_effect_original[4096];
++    uint64_t gfx_probe_display_event;
++    bool gfx_probe_display_event_sent;
++    uint8_t gfx_probe_display_event_original[4];
++    bool gfx_probe_display_revision_saved;
++    uint8_t gfx_probe_display_revision_original[8];
++    uint8_t gfx_probe_display_mode_original[24];
++    bool gfx_probe_display_saved, gfx_probe_display_done;
++    uint8_t gfx_probe_display_original[32];
++    uint8_t gfx_probe_display_stamp_original[4];
++    uint8_t gfx_probe_display_consumer_original[4];
++    bool gfx_probe_display_state_valid;
++    uint64_t gfx_probe_display_state;
++    uint64_t gfx_probe_root_complete;
++    bool gfx_probe_stamp_saved, gfx_probe_stamp_verified;
++    uint64_t gfx_probe_stamp_address;
++    uint8_t gfx_probe_stamp_original[4];
++    uint32_t gfx_probe_consumer;
++    uint64_t gfx_probe_response_write;
++    bool gfx_probe_response_saved;
++    uint64_t gfx_probe_response_address;
++    uint8_t gfx_probe_response_original[16384];
++    uint32_t gfx_probe_config;
++    uint32_t gfx_probe_fifo_page;
++    uint32_t gfx_probe_fifo_size;
++    VMAppleGfxProbeRootPrefix gfx_probe_root_prefix;
++    unsigned gfx_probe_headers;
++    uint32_t gfx_probe_cursor;
++    uint32_t gfx_probe_shared_page;
++    bool gfx_probe_address_space_valid[8];
++    VMAppleGfxProbeAddressSpace gfx_probe_address_spaces[8];
++    VMAppleGfxProbeHeap gfx_probe_heaps[8];
++    bool gfx_probe_query_pending;
++    VMAppleGfxProbeQuery gfx_probe_pending_query;
++    VMAppleGfxProbeChannel gfx_probe_channels[VMAPPLE_GFX_PROBE_CHANNELS];
++    uint64_t iosfc_probe_directory;
++    struct {
++        bool valid;
++        uint32_t id, root, size;
++    } iosfc_probe_mappings[8];
++    uint64_t iosfc_probe_ring;
++    uint64_t iosfc_probe_capacity;
++    unsigned iosfc_probe_records;
+     MemoryRegion iosfc_stub_mr;
+ #endif
+     uint64_t uuid;
+@@ -232,14 +383,1414 @@ static bool create_cfg(VMAppleMachineState *vms, MemoryRegion *mem,
+ }
+ 
+ #ifndef CONFIG_MAC_PVG_MMIO
++/* Bound diagnostic output independently for each window; no guest data DMA. */
++static void gfx_probe(VMAppleMachineState *vms, unsigned window, bool write,
++                      hwaddr offset, unsigned size, uint64_t value)
++{
++    if (vms->gfx_probe_count[window] < 128) {
++        trace_vmapple_gfx_probe(window, write, offset, size, value);
++        vms->gfx_probe_count[window]++;
++    }
++}
++
++#include "reims.inc.c"
++
++static bool gfx_probe_display_event_ready(VMAppleMachineState *vms);
++
+ static uint64_t gfx_stub_read(void *opaque, hwaddr offset, unsigned size)
+ {
+-    return 0;
++    VMAppleMachineState *vms = opaque;
++    uint32_t value = 0;
++
++#ifdef CONFIG_VMAPPLE_REIMS
++    if (vms->gfx_reims && !vms->reims_device) {
++        reims_init(vms);
++    }
++    if (vms->reims_device) {
++        uint32_t result = rvg_device_mmio_read(vms->reims_device, offset);
++        gfx_probe(vms, 0, false, offset, size, result);
++        /* Observe the original read result, never read clear-on-read state twice. */
++        if (offset == 0x1014 || offset == 0x1018 || offset == 0x102c) {
++            unsigned index = offset == 0x1014 ? 0 : offset == 0x1018 ? 1 : 2;
++            if (vms->reims_status_trace_count[index] < UINT_MAX) {
++                unsigned count = ++vms->reims_status_trace_count[index];
++                vms->reims_status_nonzero_count[index] += result != 0;
++                if ((count & (count - 1)) == 0) {
++                    trace_vmapple_reims_status_summary(
++                        qemu_clock_get_ms(QEMU_CLOCK_REALTIME), offset,
++                        count, vms->reims_status_nonzero_count[index]);
++                }
++            }
++        }
++        return result;
++    }
++#endif
++    /* Experimental write/read contract only, not capability advertisement. */
++    if (vms->gfx_probe_readback && offset == 0x1034 && size == 4) {
++        value = vms->gfx_probe_config;
++    }
++    if (vms->gfx_probe_readback && offset == 0x100c && size == 4) {
++        value = vms->gfx_probe_consumer;
++    }
++    if (vms->gfx_probe_root_wake && offset == 0x1018 && size == 4) {
++        value = vms->gfx_probe_stamp_pending;
++        vms->gfx_probe_stamp_pending = 0;
++        trace_vmapple_gfx_stamp_status(value);
++    }
++    if (offset == 0x1014 && size == 4 &&
++        gfx_probe_display_event_ready(vms)) {
++        value = 1; /* Display zero event, distinct from channel stamp bits. */
++    }
++    gfx_probe(vms, 0, false, offset, size, value);
++    return value;
++}
++
++/* Validate a single RAM region, never dispatch reads into MMIO devices. */
++static bool gfx_probe_ram_span(hwaddr address, uint64_t length)
++{
++    MemoryRegionSection section;
++    bool valid;
++
++    if (!length || address > UINT64_MAX - length) {
++        return false;
++    }
++    section = memory_region_find(get_system_memory(), address, length);
++    valid = section.mr && memory_region_is_ram(section.mr) &&
++            int128_get64(section.size) >= length;
++    if (section.mr) {
++        memory_region_unref(section.mr);
++    }
++    return valid;
++}
++
++static bool gfx_probe_read_entry(void *opaque, uint64_t address, uint32_t *entry)
++{
++    uint8_t bytes[4];
++
++    if (!gfx_probe_ram_span(address, sizeof(bytes)) ||
++        address_space_read(&address_space_memory, address,
++                           MEMTXATTRS_UNSPECIFIED, bytes, sizeof(bytes)) !=
++                           MEMTX_OK) {
++        return false;
++    }
++    *entry = ldl_le_p(bytes);
++    if (opaque) {
++        unsigned *count = opaque;
++
++        if ((*count)++ < 2) {
++            trace_vmapple_gfx_walk_entry(*count, address, *entry);
++        }
++    }
++    return true;
++}
++
++static bool gfx_probe_validate_heap(VMAppleMachineState *vms,
++                                     const VMAppleGfxProbeHeap *heap)
++{
++    uint64_t offset, root;
++    unsigned reads = 0;
++    uint64_t descriptor_address =
++        vms->gfx_probe_address_spaces[heap->address_space_id].root_address;
++    uint8_t descriptor[28];
++
++    if (!vmapple_gfx_probe_uses_table(
++            &vms->gfx_probe_address_spaces[heap->address_space_id])) {
++        /* Separate mapper service is not implemented by the table walker. */
++        trace_vmapple_gfx_walk_stage(20, 0);
++        return false;
++    }
++    if (!gfx_probe_ram_span(descriptor_address, sizeof(descriptor)) ||
++        address_space_read(&address_space_memory, descriptor_address,
++                           MEMTXATTRS_UNSPECIFIED, descriptor,
++                           sizeof(descriptor)) != MEMTX_OK) {
++        trace_vmapple_gfx_walk_stage(1, 0);
++        return false;
++    }
++    trace_vmapple_gfx_walk_descriptor(ldl_le_p(descriptor),
++                                      ldl_le_p(descriptor + 4));
++    if (!vmapple_gfx_probe_table_descriptor(descriptor, sizeof(descriptor), &root) ||
++        !gfx_probe_ram_span(root, 16384)) {
++        trace_vmapple_gfx_walk_stage(2, 0);
++        return false;
++    }
++    for (offset = 0; offset < heap->size; offset += 16384) {
++        uint64_t physical;
++        VMAppleGfxProbeWalkResult detail;
++        uint64_t length = MIN(UINT64_C(16384), heap->size - offset);
++
++        if (!vmapple_gfx_probe_translate_detail(root, heap->gpu_address + offset,
++                                                gfx_probe_read_entry, &reads,
++                                                &physical, &detail)) {
++            trace_vmapple_gfx_walk_stage(10 + detail.stage, offset);
++            return false;
++        }
++        if (!gfx_probe_ram_span(physical, length)) {
++            trace_vmapple_gfx_walk_stage(4, offset);
++            return false;
++        }
++    }
++    return true;
++}
++
++/* Opt-in diagnostic response transport only. Never signal unexecuted work. */
++static bool gfx_probe_write_empty_info(VMAppleMachineState *vms,
++                                       const VMAppleGfxProbeQuery *query)
++{
++    uint8_t response[16384], readback[16384];
++    MemoryRegionSection section;
++    bool writable;
++
++    if (!vms->gfx_probe_response_write || vms->gfx_probe_response_saved ||
++        query->response_size != sizeof(response)) {
++        return false;
++    }
++    section = memory_region_find(get_system_memory(), query->destination_page,
++                                 sizeof(response));
++    writable = section.mr && memory_region_is_ram(section.mr) &&
++               !memory_region_is_rom(section.mr) &&
++               !section.readonly &&
++               int128_get64(section.size) >= sizeof(response);
++    if (section.mr) {
++        memory_region_unref(section.mr);
++    }
++    if (!writable || !vmapple_gfx_probe_empty_info(response, sizeof(response)) ||
++        address_space_read(&address_space_memory, query->destination_page,
++                           MEMTXATTRS_UNSPECIFIED,
++                           vms->gfx_probe_response_original,
++                           sizeof(response)) != MEMTX_OK) {
++        return false;
++    }
++    vms->gfx_probe_response_address = query->destination_page;
++    /* Saved even on a partial write failure: retain originals for diagnosis. */
++    vms->gfx_probe_response_saved = true;
++    return address_space_write(&address_space_memory, query->destination_page,
++                               MEMTXATTRS_UNSPECIFIED, response,
++                               sizeof(response)) == MEMTX_OK &&
++           address_space_read(&address_space_memory, query->destination_page,
++                              MEMTXATTRS_UNSPECIFIED, readback,
++                              sizeof(readback)) == MEMTX_OK &&
++           memcmp(response, readback, sizeof(response)) == 0;
++}
++
++/* Resolve only the first page-list entry. No completion or memory writes. */
++static bool gfx_probe_map_first_page(VMAppleGfxProbeChannel *channel)
++{
++    uint64_t list_address, data_address;
++    uint8_t entry[4];
++
++    channel->first_page_valid = false;
++    channel->first_page_address = 0;
++    if (!channel->registered ||
++        !vmapple_gfx_probe_page_address(channel->page, &list_address) ||
++        !gfx_probe_ram_span(list_address, 16384) ||
++        address_space_read(&address_space_memory, list_address,
++                           MEMTXATTRS_UNSPECIFIED, entry, sizeof(entry)) !=
++                           MEMTX_OK ||
++        !vmapple_gfx_probe_page_address(ldl_le_p(entry), &data_address) ||
++        !gfx_probe_ram_span(data_address, 16384)) {
++        return false;
++    }
++    channel->first_page_address = data_address;
++    channel->first_page_valid = true;
++    return true;
++}
++
++static bool gfx_probe_complete_root(VMAppleMachineState *vms)
++{
++    uint64_t address;
++    uint8_t stamp[4], readback[4];
++    MemoryRegionSection section;
++    bool writable;
++
++    if (!vms->gfx_probe_root_complete || vms->gfx_probe_stamp_saved ||
++        vms->gfx_probe_root_prefix.failed ||
++        vms->gfx_probe_root_prefix.count != 7 ||
++        vms->gfx_probe_root_prefix.bytes != 140 ||
++        !vmapple_gfx_probe_root_stamp(vms->gfx_probe_fifo_page, 0x700, &address)) {
++        return false;
++    }
++    section = memory_region_find(get_system_memory(), address, 4);
++    writable = section.mr && memory_region_is_ram(section.mr) &&
++               !memory_region_is_rom(section.mr) && !section.readonly &&
++               int128_get64(section.size) >= 4;
++    if (section.mr) {
++        memory_region_unref(section.mr);
++    }
++    if (!writable || address_space_read(&address_space_memory, address,
++            MEMTXATTRS_UNSPECIFIED, vms->gfx_probe_stamp_original, 4) != MEMTX_OK) {
++        return false;
++    }
++    vms->gfx_probe_stamp_address = address;
++    vms->gfx_probe_stamp_saved = true;
++    stl_le_p(stamp, 0x700);
++    vms->gfx_probe_stamp_verified =
++        address_space_write(&address_space_memory, address,
++                            MEMTXATTRS_UNSPECIFIED, stamp, 4) == MEMTX_OK &&
++        address_space_read(&address_space_memory, address,
++                           MEMTXATTRS_UNSPECIFIED, readback, 4) == MEMTX_OK &&
++        memcmp(stamp, readback, 4) == 0;
++    if (vms->gfx_probe_stamp_verified) {
++        vms->gfx_probe_consumer = 140;
++        if (vms->gfx_probe_root_wake) {
++            vms->gfx_probe_stamp_pending = 1;
++            qemu_irq_pulse(qdev_get_gpio_in(vms->gic,
++                                           vms->irqmap[VMAPPLE_APV_GFX]));
++            trace_vmapple_gfx_root_wake();
++        }
++    }
++    return vms->gfx_probe_stamp_verified;
++}
++
++/* Bounded observer; independent switch permits one handled-prefix completion. */
++static void gfx_probe_fifo(VMAppleMachineState *vms, uint32_t producer)
++{
++    hwaddr base = ((uint64_t)vms->gfx_probe_fifo_page << 14) + 16384;
++    uint32_t capacity = vms->gfx_probe_fifo_size;
++
++    while (vms->gfx_probe_headers < 8 &&
++           vmapple_gfx_probe_span(capacity, vms->gfx_probe_cursor,
++                                  producer, 12)) {
++        uint8_t header[12];
++        VMAppleGfxProbeHeader decoded;
++        bool ok, handled = false;
++        hwaddr address = base + vms->gfx_probe_cursor;
++        MemoryRegionSection section = memory_region_find(get_system_memory(),
++                                                         address, sizeof(header));
++
++        ok = section.mr && memory_region_is_ram(section.mr) &&
++             int128_get64(section.size) >= sizeof(header) &&
++             address_space_read(&address_space_memory, address,
++                                MEMTXATTRS_UNSPECIFIED, header,
++                                sizeof(header)) == MEMTX_OK;
++        if (section.mr) {
++            memory_region_unref(section.mr);
++        }
++        if (!ok) {
++            return;
++        }
++        if (!vmapple_gfx_probe_decode(header, sizeof(header),
++                                     producer - vms->gfx_probe_cursor,
++                                     &decoded) ||
++            !vmapple_gfx_probe_span(capacity, vms->gfx_probe_cursor,
++                                    producer, decoded.length)) {
++            return;
++        }
++        if (decoded.opcode == 56) {
++            uint8_t payload[16];
++            VMAppleGfxProbeAddressSpace space;
++            uint32_t position;
++            bool valid = false;
++
++            if (vmapple_gfx_probe_payload(&decoded, 0, sizeof(payload),
++                                          &position) &&
++                gfx_probe_ram_span(address + position, sizeof(payload)) &&
++                address_space_read(&address_space_memory, address + position,
++                                   MEMTXATTRS_UNSPECIFIED, payload,
++                                   sizeof(payload)) == MEMTX_OK &&
++                vmapple_gfx_probe_address_space(&decoded, payload,
++                                                sizeof(payload), &space) &&
++                gfx_probe_ram_span(space.root_address, 16384)) {
++                unsigned id = space.id;
++                VMAppleGfxProbeAddressSpace *old =
++                    &vms->gfx_probe_address_spaces[id];
++
++                if (!vms->gfx_probe_address_space_valid[id] ||
++                    (old->root_address == space.root_address &&
++                     old->extent == space.extent && old->flag == space.flag)) {
++                    *old = space;
++                    vms->gfx_probe_address_space_valid[id] = true;
++                    valid = true;
++                }
++            }
++            handled = valid;
++            trace_vmapple_gfx_address_space(valid);
++        }
++        if (decoded.opcode == 51) {
++            uint8_t payload[12];
++            VMAppleGfxProbeHeap heap;
++            uint32_t position;
++            bool valid =
++                vmapple_gfx_probe_payload(&decoded, 0, sizeof(payload),
++                                          &position) &&
++                gfx_probe_ram_span(address + position, sizeof(payload)) &&
++                address_space_read(&address_space_memory, address + position,
++                                   MEMTXATTRS_UNSPECIFIED, payload,
++                                   sizeof(payload)) == MEMTX_OK &&
++                vmapple_gfx_probe_heap(&decoded, payload, sizeof(payload),
++                                       &heap) &&
++                vmapple_gfx_probe_heap_register(vms->gfx_probe_heaps,
++                    vms->gfx_probe_address_space_valid, &heap);
++
++            bool mapped = valid && gfx_probe_validate_heap(vms, &heap);
++
++            /* Association registration does not execute or dereference heap. */
++            handled = valid;
++            trace_vmapple_gfx_heap(valid);
++            trace_vmapple_gfx_heap_mapping(mapped);
++        }
++        if (decoded.opcode == 58) {
++            uint8_t payload[12];
++            VMAppleGfxProbeQuery query;
++            uint32_t position;
++            bool valid = false;
++
++            vms->gfx_probe_query_pending = false;
++            memset(&vms->gfx_probe_pending_query, 0,
++                   sizeof(vms->gfx_probe_pending_query));
++            if (vmapple_gfx_probe_payload(&decoded, 0, sizeof(payload),
++                                           &position) &&
++                gfx_probe_ram_span(address + position, sizeof(payload)) &&
++                address_space_read(&address_space_memory, address + position,
++                                   MEMTXATTRS_UNSPECIFIED, payload,
++                                   sizeof(payload)) == MEMTX_OK &&
++                vmapple_gfx_probe_query(&decoded, payload, sizeof(payload),
++                                        &query) &&
++                gfx_probe_ram_span(query.destination_page,
++                                   query.response_size)) {
++                vms->gfx_probe_pending_query = query;
++                vms->gfx_probe_query_pending = true;
++                valid = true;
++                if (vms->gfx_probe_response_write) {
++                    bool verified = gfx_probe_write_empty_info(vms, &query);
++
++                    handled = verified;
++
++                    trace_vmapple_gfx_response_write(
++                        vms->gfx_probe_response_saved, verified);
++                }
++            }
++            trace_vmapple_gfx_query_pending(valid);
++        }
++        trace_vmapple_gfx_fifo_probe(producer, ldl_le_p(header),
++                                    decoded.length, decoded.tag);
++        /* Sample no more than 32 payload bytes per bounded request. */
++        for (uint32_t offset = 0; offset < 32; offset += 4) {
++            uint32_t position;
++            uint8_t word[4];
++            MemoryRegionSection payload_section;
++            bool readable;
++
++            if (!vmapple_gfx_probe_payload(&decoded, offset, sizeof(word),
++                                           &position)) {
++                break;
++            }
++            payload_section = memory_region_find(get_system_memory(),
++                                                 address + position,
++                                                 sizeof(word));
++            readable = payload_section.mr &&
++                       memory_region_is_ram(payload_section.mr) &&
++                       int128_get64(payload_section.size) >= sizeof(word) &&
++                       address_space_read(&address_space_memory,
++                                          address + position,
++                                          MEMTXATTRS_UNSPECIFIED, word,
++                                          sizeof(word)) == MEMTX_OK;
++            if (payload_section.mr) {
++                memory_region_unref(payload_section.mr);
++            }
++            if (!readable) {
++                break;
++            }
++            trace_vmapple_gfx_payload_probe(decoded.opcode, offset,
++                                            ldl_le_p(word));
++            if (decoded.opcode == 48 && decoded.length == 16 &&
++                !decoded.metadata_count && offset == 0 &&
++                vms->gfx_probe_shared_page) {
++                uint32_t channel_offset;
++                uint32_t id = ldl_le_p(word);
++                uint8_t control[20];
++                hwaddr shared = (uint64_t)vms->gfx_probe_shared_page << 14;
++                MemoryRegionSection cs;
++
++                if (!vmapple_gfx_probe_channel(id, &channel_offset)) {
++                    break;
++                }
++                cs = memory_region_find(get_system_memory(),
++                                        shared + channel_offset,
++                                        sizeof(control));
++                if (cs.mr && memory_region_is_ram(cs.mr) &&
++                    int128_get64(cs.size) >= sizeof(control) &&
++                    address_space_read(&address_space_memory,
++                                       shared + channel_offset,
++                                       MEMTXATTRS_UNSPECIFIED, control,
++                                       sizeof(control)) == MEMTX_OK) {
++                    bool registered = vmapple_gfx_probe_register(
++                        vms->gfx_probe_channels, id, control, sizeof(control));
++
++                    bool mapped = registered && gfx_probe_map_first_page(
++                        &vms->gfx_probe_channels[id - 1]);
++
++                    handled = mapped && id == vms->gfx_probe_root_prefix.count - 1;
++                    trace_vmapple_gfx_channel_register(id, registered);
++                    trace_vmapple_gfx_channel_mapping(id, mapped);
++                    trace_vmapple_gfx_channel_probe(id, ldl_le_p(control),
++                        ldl_le_p(control + 4), ldl_le_p(control + 8),
++                        ldl_le_p(control + 12), ldl_le_p(control + 16));
++                }
++                if (cs.mr) {
++                    memory_region_unref(cs.mr);
++                }
++            }
++        }
++        bool candidate = vmapple_gfx_probe_root_prefix(
++            &vms->gfx_probe_root_prefix, &decoded, handled);
++
++        if (candidate && vms->gfx_probe_root_complete) {
++            bool verified = gfx_probe_complete_root(vms);
++
++            trace_vmapple_gfx_root_complete(vms->gfx_probe_stamp_saved, verified,
++                                            vms->gfx_probe_consumer);
++        }
++        trace_vmapple_gfx_root_candidate(candidate,
++                                         vms->gfx_probe_root_prefix.failed);
++        vms->gfx_probe_headers++;
++        vms->gfx_probe_cursor += decoded.length;
++    }
++}
++
++/* Metadata registration only; no resource execution or completion. */
++static bool gfx_probe_register_task_command(VMAppleMachineState *vms,
++    const VMAppleGfxProbeHeader *header, uint64_t address)
++{
++    uint8_t payload[16];
++    uint32_t position, size;
++
++    if (header->opcode != 56 && header->opcode != 51) {
++        return false;
++    }
++    size = header->opcode == 56 ? 16 : 12;
++    if (!vmapple_gfx_probe_payload(header, 0, size, &position) ||
++        !gfx_probe_ram_span(address + position, size) ||
++        address_space_read(&address_space_memory, address + position,
++            MEMTXATTRS_UNSPECIFIED, payload, size) != MEMTX_OK) {
++        return false;
++    }
++    if (header->opcode == 56) {
++        VMAppleGfxProbeAddressSpace space;
++        VMAppleGfxProbeAddressSpace *old;
++
++        if (!vmapple_gfx_probe_address_space(header, payload, size, &space) ||
++            !gfx_probe_ram_span(space.root_address, 16384)) {
++            return false;
++        }
++        old = &vms->gfx_probe_address_spaces[space.id];
++        if (vms->gfx_probe_address_space_valid[space.id] &&
++            (old->root_address != space.root_address ||
++             old->extent != space.extent || old->flag != space.flag)) {
++            return false;
++        }
++        *old = space;
++        vms->gfx_probe_address_space_valid[space.id] = true;
++        return true;
++    } else {
++        VMAppleGfxProbeHeap heap;
++
++        return vmapple_gfx_probe_heap(header, payload, size, &heap) &&
++            vmapple_gfx_probe_heap_register(vms->gfx_probe_heaps,
++                vms->gfx_probe_address_space_valid, &heap);
++    }
++}
++
++/* Writable RAM only, with original bytes retained by the caller. */
++static bool gfx_probe_save_ram(hwaddr address, uint8_t *original, size_t size)
++{
++    MemoryRegionSection section = memory_region_find(get_system_memory(),
++                                                    address, size);
++    bool writable = section.mr && memory_region_is_ram(section.mr) &&
++                    !memory_region_is_rom(section.mr) && !section.readonly &&
++                    int128_get64(section.size) >= size;
++
++    if (section.mr) {
++        memory_region_unref(section.mr);
++    }
++    return writable && address_space_read(&address_space_memory, address,
++        MEMTXATTRS_UNSPECIFIED, original, size) == MEMTX_OK;
++}
++
++static bool gfx_probe_write_verify(hwaddr address, const uint8_t *bytes,
++                                   size_t size)
++{
++    uint8_t check[32];
++
++    return size <= sizeof(check) &&
++        address_space_write(&address_space_memory, address,
++            MEMTXATTRS_UNSPECIFIED, bytes, size) == MEMTX_OK &&
++        address_space_read(&address_space_memory, address,
++            MEMTXATTRS_UNSPECIFIED, check, size) == MEMTX_OK &&
++        memcmp(bytes, check, size) == 0;
++}
++
++/* Register a disconnected display: no invented modes or rendering features. */
++/* Announce a published timing only after guest enables mode events. */
++static bool gfx_probe_display_event_ready(VMAppleMachineState *vms)
++{
++    uint32_t enabled;
++    uint8_t pending[4];
++    uint64_t address = vms->gfx_probe_display_state + 256;
++
++    if (!vms->gfx_probe_display_event || !vms->gfx_probe_display_mode ||
++        !vms->gfx_probe_display_done || vms->gfx_probe_display_event_sent ||
++        !gfx_probe_read_entry(NULL, address + 4, &enabled) || !(enabled & 4) ||
++        !gfx_probe_save_ram(address, vms->gfx_probe_display_event_original, 4)) {
++        return false;
++    }
++    stl_le_p(pending, ldl_le_p(vms->gfx_probe_display_event_original) | 4);
++    if (!gfx_probe_write_verify(address, pending, sizeof(pending))) {
++        return false;
++    }
++    vms->gfx_probe_display_event_sent = true;
++    trace_vmapple_gfx_display_event();
++    return true;
++}
++
++static void gfx_probe_complete_display(VMAppleMachineState *vms,
++                                       uint64_t control)
++{
++    uint64_t stamp = ((uint64_t)vms->gfx_probe_fifo_page << 14) + 4 * 4;
++    uint8_t state[32], value[4];
++
++    if (!vms->gfx_probe_display_complete || vms->gfx_probe_display_saved ||
++        !vms->gfx_probe_display_state_valid || !vms->gfx_probe_fifo_page ||
++        !gfx_probe_save_ram(vms->gfx_probe_display_state,
++                           vms->gfx_probe_display_original, 32) ||
++        !gfx_probe_save_ram(stamp, vms->gfx_probe_display_stamp_original, 4) ||
++        !gfx_probe_save_ram(control + 4,
++                           vms->gfx_probe_display_consumer_original, 4)) {
++        return;
++    }
++    vms->gfx_probe_display_saved = true;
++    memcpy(state, vms->gfx_probe_display_original, sizeof(state));
++    /* Only acknowledge display zero; preserve every unimplemented field. */
++    stw_le_p(state + 18, 0);
++    if (!gfx_probe_write_verify(vms->gfx_probe_display_state, state, 32)) {
++        return;
++    }
++    if (vms->gfx_probe_display_mode) {
++        uint8_t modes[24];
++        uint64_t address = vms->gfx_probe_display_state + 512;
++
++        if (!gfx_probe_save_ram(address,
++                                vms->gfx_probe_display_mode_original,
++                                sizeof(modes))) {
++            return;
++        }
++        memcpy(modes, vms->gfx_probe_display_mode_original, sizeof(modes));
++        /* One timing entry: 1024x768 at 60 Hz, no connection flags. */
++        stw_le_p(modes + 8, 1);
++        stw_le_p(modes + 16, 1024);
++        stw_le_p(modes + 18, 768);
++        stl_le_p(modes + 20, 60U << 16);
++        if (!gfx_probe_write_verify(address, modes, sizeof(modes))) {
++            return;
++        }
++        trace_vmapple_gfx_display_mode();
++    }
++    stl_le_p(value, 20);
++    if (!gfx_probe_write_verify(control + 4, value, 4)) {
++        return;
++    }
++    stl_le_p(value, 256);
++    if (!gfx_probe_write_verify(stamp, value, 4)) {
++        return;
++    }
++    vms->gfx_probe_display_done = true;
++    vms->gfx_probe_stamp_pending |= 1 << 4;
++    if (vms->gfx_probe_root_wake) {
++        qemu_irq_pulse(qdev_get_gpio_in(vms->gic,
++                                       vms->irqmap[VMAPPLE_APV_GFX]));
++    }
++    trace_vmapple_gfx_display_complete();
++}
++
++/* Only the first timing revision acknowledgement, never an arbitrary command. */
++static void gfx_probe_ack_display_revision(VMAppleMachineState *vms,
++                                          uint64_t control, uint64_t address)
++{
++    uint32_t revision;
++    uint8_t payload[8], value[4];
++    uint64_t stamp = ((uint64_t)vms->gfx_probe_fifo_page << 14) + 16;
++
++    if (!vms->gfx_probe_display_event_sent ||
++        vms->gfx_probe_display_revision_saved ||
++        !gfx_probe_read_entry(NULL, vms->gfx_probe_display_state + 512,
++                              &revision) ||
++        !gfx_probe_save_ram(address + 12, payload, sizeof(payload)) ||
++        ldl_le_p(payload) != 0 || ldl_le_p(payload + 4) != revision ||
++        !gfx_probe_save_ram(control + 4,
++                            vms->gfx_probe_display_revision_original, 4) ||
++        ldl_le_p(vms->gfx_probe_display_revision_original) != 20 ||
++        !gfx_probe_save_ram(stamp,
++                            vms->gfx_probe_display_revision_original + 4, 4) ||
++        ldl_le_p(vms->gfx_probe_display_revision_original + 4) != 256) {
++        return;
++    }
++    vms->gfx_probe_display_revision_saved = true;
++    stl_le_p(value, 40);
++    if (!gfx_probe_write_verify(control + 4, value, 4)) {
++        return;
++    }
++    stl_le_p(value, 512);
++    if (!gfx_probe_write_verify(stamp, value, 4)) {
++        return;
++    }
++    vms->gfx_probe_stamp_pending |= 1 << 4;
++    if (vms->gfx_probe_root_wake) {
++        qemu_irq_pulse(qdev_get_gpio_in(vms->gic,
++                                       vms->irqmap[VMAPPLE_APV_GFX]));
++    }
++    trace_vmapple_gfx_display_revision(revision);
++}
++
++/* Bounded, no-wrap ordered metadata executor; no rendering or mapper access. */
++static void gfx_probe_process_lifecycle(VMAppleMachineState *vms, uint64_t control)
++{
++    VMAppleGfxProbeChannel *channel = &vms->gfx_probe_channels[1];
++    uint64_t stamp = ((uint64_t)vms->gfx_probe_fifo_page << 14) + 8;
++    uint32_t producer, consumer;
++
++    if (!vms->gfx_probe_task_lifecycle || vms->gfx_probe_task_prefix ||
++        vms->gfx_probe_lifecycle_poisoned || !vms->gfx_probe_fifo_page ||
++        !channel->registered || !gfx_probe_map_first_page(channel) ||
++        !gfx_probe_read_entry(NULL, control, &producer) ||
++        !gfx_probe_read_entry(NULL, control + 4, &consumer) ||
++        producer > 16384 || (producer & 3) ||
++        consumer != vms->gfx_probe_lifecycle_cursor || producer < consumer) {
++        return;
++    }
++    for (unsigned n = 0; n < 64 && producer > consumer; n++) {
++        uint8_t bytes[28], original[8], value[4];
++        VMAppleGfxProbeHeader header;
++        VMAppleGfxLifecycle candidate = vms->gfx_probe_lifecycle;
++        uint64_t address = channel->first_page_address + consumer;
++        uint32_t taskid;
++
++        if (producer - consumer < 12 || !gfx_probe_ram_span(address, 12) ||
++            address_space_read(&address_space_memory, address,
++                MEMTXATTRS_UNSPECIFIED, bytes, 12) != MEMTX_OK ||
++            !vmapple_gfx_probe_decode(bytes, 12, producer - consumer, &header) ||
++            header.length > sizeof(bytes) || header.length < 16 ||
++            header.tag != vms->gfx_probe_lifecycle_tag + 256 ||
++            vms->gfx_probe_lifecycle_tag > UINT32_MAX - 256 ||
++            !gfx_probe_ram_span(address, header.length) ||
++            address_space_read(&address_space_memory, address,
++                MEMTXATTRS_UNSPECIFIED, bytes, header.length) != MEMTX_OK ||
++            !vmapple_gfx_lifetime_apply(&candidate, &header, bytes + 12,
++                header.length - 12)) {
++            return;
++        }
++        taskid = ldl_le_p(bytes + 12);
++        if (header.opcode == 56) {
++            VMAppleGfxTaskLifetime *task =
++                vmapple_gfx_lifetime_find(&candidate, taskid >> 1);
++            if (!task || !gfx_probe_ram_span(task->root, 28)) {
++                return;
++            }
++        }
++        if (!gfx_probe_save_ram(control + 4, original, 4) ||
++            !gfx_probe_save_ram(stamp, original + 4, 4)) {
++            return;
++        }
++        stl_le_p(value, consumer + header.length);
++        if (!gfx_probe_write_verify(control + 4, value, 4)) {
++            vms->gfx_probe_lifecycle_poisoned = true;
++            return;
++        }
++        stl_le_p(value, header.tag);
++        if (!gfx_probe_write_verify(stamp, value, 4)) {
++            gfx_probe_write_verify(control + 4, original, 4);
++            gfx_probe_write_verify(stamp, original + 4, 4);
++            vms->gfx_probe_lifecycle_poisoned = true;
++            return;
++        }
++        vms->gfx_probe_lifecycle = candidate;
++        consumer += header.length;
++        vms->gfx_probe_lifecycle_cursor = consumer;
++        vms->gfx_probe_lifecycle_tag = header.tag;
++        vms->gfx_probe_stamp_pending |= 1 << 2;
++        trace_vmapple_gfx_lifecycle(header.opcode, consumer, header.tag);
++        if (vms->gfx_probe_root_wake) {
++            qemu_irq_pulse(qdev_get_gpio_in(vms->gic,
++                                           vms->irqmap[VMAPPLE_APV_GFX]));
++        }
++    }
++}
++
++/* Process only the first registered task+heap pair. Unknown/deletion commands
++ * remain pending; this cannot satisfy a dependency beyond tag 512. */
++static void gfx_probe_complete_task_prefix(VMAppleMachineState *vms,
++                                          uint64_t control)
++{
++    VMAppleGfxProbeChannel *channel = &vms->gfx_probe_channels[1];
++    VMAppleGfxProbeHeader task_header, heap_header;
++    VMAppleGfxProbeAddressSpace task;
++    VMAppleGfxProbeHeap heap;
++    uint8_t bytes[52], value[4];
++    uint64_t stamp = ((uint64_t)vms->gfx_probe_fifo_page << 14) + 8;
++    uint32_t consumer, producer;
++
++    if (!vms->gfx_probe_task_prefix || vms->gfx_probe_task_prefix_saved ||
++        !vms->gfx_probe_fifo_page || !channel->registered ||
++        !gfx_probe_read_entry(NULL, control, &producer) || producer < 52 ||
++        producer > 16384 || (producer & 3) ||
++        !gfx_probe_read_entry(NULL, control + 4, &consumer) || consumer ||
++        !gfx_probe_map_first_page(channel) ||
++        !gfx_probe_ram_span(channel->first_page_address, sizeof(bytes)) ||
++        address_space_read(&address_space_memory, channel->first_page_address,
++            MEMTXATTRS_UNSPECIFIED, bytes, sizeof(bytes)) != MEMTX_OK ||
++        !vmapple_gfx_probe_decode(bytes, 12, sizeof(bytes), &task_header) ||
++        !vmapple_gfx_probe_decode(bytes + 28, 12, 24, &heap_header) ||
++        task_header.tag != 256 || heap_header.tag != 512 ||
++        !vmapple_gfx_probe_address_space(&task_header, bytes + 12, 16, &task) ||
++        !vmapple_gfx_probe_heap(&heap_header, bytes + 40, 12, &heap) ||
++        task.id != heap.address_space_id ||
++        !gfx_probe_register_task_command(vms, &task_header,
++            channel->first_page_address) ||
++        !gfx_probe_register_task_command(vms, &heap_header,
++            channel->first_page_address + 28) ||
++        !gfx_probe_save_ram(control + 4, vms->gfx_probe_task_prefix_original, 4) ||
++        !gfx_probe_save_ram(stamp, vms->gfx_probe_task_prefix_original + 4, 4)) {
++        return;
++    }
++    vms->gfx_probe_task_prefix_saved = true;
++    stl_le_p(value, 52);
++    if (!gfx_probe_write_verify(control + 4, value, 4)) {
++        return;
++    }
++    stl_le_p(value, 512);
++    if (!gfx_probe_write_verify(stamp, value, 4)) {
++        return;
++    }
++    vms->gfx_probe_stamp_pending |= 1 << 2;
++    trace_vmapple_gfx_task_prefix(task.id);
++    if (vms->gfx_probe_root_wake) {
++        qemu_irq_pulse(qdev_get_gpio_in(vms->gic,
++                                       vms->irqmap[VMAPPLE_APV_GFX]));
++    }
++}
++
++/* Resolve a submitted task from the live definition ring without pretending
++ * that ignored object deletions have been executed. No registry or guest writes. */
++static void gfx_probe_submission_segment(VMAppleMachineState *vms,
++                                         const uint8_t *submission)
++{
++    VMAppleGfxProbeChannel *channel = &vms->gfx_probe_channels[1];
++    uint32_t control_offset, producer, task = ldl_le_p(submission + 8);
++    uint8_t bytes[28], descriptor[28], segment[256];
++    uint64_t definition = 0, heap_base = 0, root, physical;
++    uint32_t heap_size = 0;
++    VMAppleGfxProbeResourceDelete deleted[64];
++    unsigned deleted_count = 0;
++    uint64_t gpu = ldq_le_p(submission + 44);
++    uint64_t size = ldq_le_p(submission + 52);
++    uint64_t shared = (uint64_t)vms->gfx_probe_shared_page << 14;
++    VMAppleGfxProbeWalkResult detail;
++
++    if (!size || size > sizeof(segment) || (gpu & 16383) + size > 16384 ||
++        !channel->registered || !gfx_probe_map_first_page(channel) ||
++        !vmapple_gfx_probe_channel(2, &control_offset) ||
++        !gfx_probe_read_entry(NULL, shared + control_offset, &producer) ||
++        producer > 16384 || (producer & 3)) {
++        trace_vmapple_gfx_segment_result(1);
++        return;
++    }
++    if (vms->gfx_probe_task_lifecycle) {
++        VMAppleGfxTaskLifetime *live = vmapple_gfx_lifetime_find(
++            &vms->gfx_probe_lifecycle, task);
++        uint32_t dependency_channel = ldl_le_p(submission);
++        uint32_t dependency_tag = ldl_le_p(submission + 4);
++        uint32_t guest_stamp;
++        uint64_t stamp = ((uint64_t)vms->gfx_probe_fifo_page << 14) + 8;
++
++        if (vms->gfx_probe_lifecycle_poisoned || dependency_channel != 2 ||
++            !dependency_tag || (dependency_tag & 255) ||
++            dependency_tag > vms->gfx_probe_lifecycle_tag ||
++            !gfx_probe_read_entry(NULL, stamp, &guest_stamp) ||
++            guest_stamp != vms->gfx_probe_lifecycle_tag ||
++            !live || !live->live || live->mapper || !live->heap ||
++            gpu > live->extent || size > live->extent - gpu) {
++            trace_vmapple_gfx_segment_result(13);
++            return;
++        }
++        definition = live->root;
++        heap_base = live->heap;
++        heap_size = live->heap_size;
++        deleted_count = vms->gfx_probe_lifecycle.deleted_count;
++        memcpy(deleted, vms->gfx_probe_lifecycle.deleted,
++               deleted_count * sizeof(deleted[0]));
++        trace_vmapple_gfx_submission_generation(task, live->generation,
++                                               dependency_tag);
++    }
++    for (uint32_t cursor = 0; !vms->gfx_probe_task_lifecycle &&
++         cursor + 12 <= producer;) {
++        VMAppleGfxProbeHeader header;
++        uint64_t address = channel->first_page_address + cursor;
++
++        if (!gfx_probe_ram_span(address, 12) ||
++            address_space_read(&address_space_memory, address,
++                MEMTXATTRS_UNSPECIFIED, bytes, 12) != MEMTX_OK ||
++            !vmapple_gfx_probe_decode(bytes, 12, producer - cursor, &header)) {
++            trace_vmapple_gfx_segment_result(2);
++            return;
++        }
++        if (header.opcode == 56 && !header.metadata_count && header.length == 28) {
++            if (!gfx_probe_ram_span(address, 28) ||
++                address_space_read(&address_space_memory, address,
++                    MEMTXATTRS_UNSPECIFIED, bytes, 28) != MEMTX_OK) {
++                return;
++            }
++            if ((ldl_le_p(bytes + 12) >> 1) == task) {
++                uint64_t candidate = (uint64_t)ldl_le_p(bytes + 24) << 14;
++                if ((ldl_le_p(bytes + 12) & 1) ||
++                    (definition && definition != candidate)) {
++                    trace_vmapple_gfx_segment_result(3);
++                    return;
++                }
++                definition = candidate;
++            }
++        }
++        if (header.opcode == 51 && !header.metadata_count && header.length == 24) {
++            if (!gfx_probe_ram_span(address, 24) ||
++                address_space_read(&address_space_memory, address,
++                    MEMTXATTRS_UNSPECIFIED, bytes, 24) != MEMTX_OK) {
++                return;
++            }
++            if (ldl_le_p(bytes + 12) == task) {
++                uint64_t candidate = (uint64_t)ldl_le_p(bytes + 16) << 14;
++                uint32_t extent = ldl_le_p(bytes + 20);
++                if (heap_base && (heap_base != candidate || heap_size != extent)) {
++                    trace_vmapple_gfx_segment_result(6);
++                    return;
++                }
++                heap_base = candidate;
++                heap_size = extent;
++            }
++        }
++        if (header.opcode == 37) {
++            VMAppleGfxProbeResourceDelete deletion;
++
++            if (header.length != 20 || header.metadata_count ||
++                !gfx_probe_ram_span(address, 20) ||
++                address_space_read(&address_space_memory, address,
++                    MEMTXATTRS_UNSPECIFIED, bytes, 20) != MEMTX_OK ||
++                !vmapple_gfx_probe_resource_delete(&header, bytes + 12, 8,
++                    &deletion) || deleted_count == ARRAY_SIZE(deleted)) {
++                trace_vmapple_gfx_segment_result(11);
++                return;
++            }
++            deleted[deleted_count++] = deletion;
++        }
++        cursor += header.length;
++    }
++    if (!definition || !gfx_probe_ram_span(definition, sizeof(descriptor)) ||
++        address_space_read(&address_space_memory, definition,
++            MEMTXATTRS_UNSPECIFIED, descriptor, sizeof(descriptor)) != MEMTX_OK ||
++        !vmapple_gfx_probe_table_descriptor(descriptor, sizeof(descriptor), &root)) {
++        trace_vmapple_gfx_segment_result(4);
++        return;
++    }
++    if (!vmapple_gfx_probe_translate_detail(root, gpu, gfx_probe_read_entry,
++            NULL, &physical, &detail) || !gfx_probe_ram_span(physical, size) ||
++        address_space_read(&address_space_memory, physical,
++            MEMTXATTRS_UNSPECIFIED, segment, size) != MEMTX_OK) {
++        trace_vmapple_gfx_segment_result(5);
++        return;
++    }
++    trace_vmapple_gfx_segment_result(0);
++    /* A buffer resource occupies a 12-byte heap slot: type/size, GPU pointer. */
++    if (size == 40 && ldl_le_p(segment) == 40 &&
++        ldl_le_p(segment + 4) == 2 && ldl_le_p(segment + 8) == 0x132 &&
++        ldl_le_p(segment + 12) == 32) {
++        uint32_t resource = ldl_le_p(segment + 16);
++        uint64_t slot_offset = (uint64_t)resource * 12;
++
++        /* Conservative until resource generation/redefinition is modeled:
++         * never use a resource named by any pending deletion in this ring. */
++        for (unsigned i = 0; i < deleted_count; i++) {
++            if (deleted[i].task == task && deleted[i].resource == resource) {
++                trace_vmapple_gfx_segment_result(12);
++                return;
++            }
++        }
++        uint8_t slot[12], buffer[16];
++        uint64_t slot_gpu, object_gpu;
++
++        if (!heap_base || heap_size > 16 * 1024 * 1024 ||
++            slot_offset + sizeof(slot) > heap_size) {
++            trace_vmapple_gfx_segment_result(7);
++            return;
++        }
++        slot_gpu = heap_base + slot_offset;
++        if ((slot_gpu & 16383) + sizeof(slot) > 16384 ||
++            !vmapple_gfx_probe_translate(root, slot_gpu, gfx_probe_read_entry,
++                NULL, &physical) || !gfx_probe_ram_span(physical, sizeof(slot)) ||
++            address_space_read(&address_space_memory, physical,
++                MEMTXATTRS_UNSPECIFIED, slot, sizeof(slot)) != MEMTX_OK) {
++            trace_vmapple_gfx_segment_result(8);
++            return;
++        }
++        for (unsigned pos = 0; pos < sizeof(slot); pos += 4) {
++            trace_vmapple_gfx_resource_word(0, pos, ldl_le_p(slot + pos));
++        }
++        object_gpu = ldq_le_p(slot + 4);
++        if (slot[0] != 1 || (ldl_le_p(slot) >> 8) != sizeof(buffer) ||
++            (object_gpu & 16383) + sizeof(buffer) > 16384 ||
++            !vmapple_gfx_probe_translate(root, object_gpu, gfx_probe_read_entry,
++                NULL, &physical) || !gfx_probe_ram_span(physical, sizeof(buffer)) ||
++            address_space_read(&address_space_memory, physical,
++                MEMTXATTRS_UNSPECIFIED, buffer, sizeof(buffer)) != MEMTX_OK) {
++            trace_vmapple_gfx_segment_result(9);
++            return;
++        }
++        for (unsigned pos = 0; pos < sizeof(buffer); pos += 4) {
++            trace_vmapple_gfx_resource_word(1, pos, ldl_le_p(buffer + pos));
++        }
++        VMAppleGfxProbeFill fill;
++        uint64_t backing = (uint64_t)ldl_le_p(buffer + 8) << 14;
++        uint32_t first_word;
++
++        if (ldl_le_p(buffer + 12) || !backing ||
++            !vmapple_gfx_probe_fill(segment, size, ldq_le_p(buffer), &fill) ||
++            backing > UINT64_MAX - fill.offset ||
++            ((backing + fill.offset) & 16383) + fill.length > 16384 ||
++            !vmapple_gfx_probe_translate(root, backing + fill.offset,
++                gfx_probe_read_entry, NULL, &physical) ||
++            !gfx_probe_ram_span(physical, fill.length) ||
++            !gfx_probe_read_entry(NULL, physical, &first_word)) {
++            trace_vmapple_gfx_segment_result(10);
++            return;
++        }
++        trace_vmapple_gfx_resource_word(2, 0, first_word);
++        /* Explicit diagnostic intervention only: dependency scheduling is not
++         * implemented, so never advance consumer, stamp, or signal completion. */
++        bool ordered = vms->gfx_probe_fill_complete &&
++            vms->gfx_probe_task_lifecycle && !vms->gfx_probe_lifecycle_poisoned &&
++            vms->gfx_probe_fill_control && !vms->gfx_probe_fill_poisoned &&
++            vmapple_gfx_probe_single_submission(submission, 60,
++                vms->gfx_probe_lifecycle_tag, vms->gfx_probe_lifecycle_tag);
++        if ((vms->gfx_probe_fill_effect || ordered) &&
++            (ordered || !vms->gfx_probe_fill_effect_saved)) {
++            uint8_t expected[4096], check[4096];
++            bool verified;
++
++            if (!gfx_probe_save_ram(physical,
++                    vms->gfx_probe_fill_effect_original, fill.length)) {
++                return;
++            }
++            vms->gfx_probe_fill_effect_saved = true;
++            memset(expected, fill.value, fill.length);
++            verified = address_space_write(&address_space_memory, physical,
++                MEMTXATTRS_UNSPECIFIED, expected, fill.length) == MEMTX_OK &&
++                address_space_read(&address_space_memory, physical,
++                    MEMTXATTRS_UNSPECIFIED, check, fill.length) == MEMTX_OK &&
++                memcmp(expected, check, fill.length) == 0;
++            if (!verified) {
++                address_space_write(&address_space_memory, physical,
++                    MEMTXATTRS_UNSPECIFIED, vms->gfx_probe_fill_effect_original,
++                    fill.length);
++            }
++            if (!ordered) {
++                trace_vmapple_gfx_fill_effect(verified, fill.length);
++            }
++            if (verified && ordered) {
++                uint8_t original[8], value[4];
++                uint32_t consumer;
++                uint64_t stamp;
++                uint64_t control = vms->gfx_probe_fill_control;
++                bool completed = false;
++                if (vmapple_gfx_probe_channel_stamp(
++                        (uint64_t)vms->gfx_probe_fifo_page << 14, 1, &stamp) &&
++                    gfx_probe_read_entry(NULL, control + 4, &consumer) &&
++                    consumer == vms->gfx_probe_fill_cursor &&
++                    gfx_probe_save_ram(control + 4, original, 4) &&
++                    gfx_probe_save_ram(stamp, original + 4, 4)) {
++                    stl_le_p(value, consumer + vms->gfx_probe_fill_command_length);
++                    if (gfx_probe_write_verify(control + 4, value, 4)) {
++                        stl_le_p(value, vms->gfx_probe_fill_tag + 256);
++                        completed = gfx_probe_write_verify(stamp, value, 4);
++                    }
++                    if (!completed) {
++                        gfx_probe_write_verify(control + 4, original, 4);
++                        gfx_probe_write_verify(stamp, original + 4, 4);
++                    }
++                }
++                vms->gfx_probe_fill_poisoned = !completed;
++                if (completed) {
++                    vms->gfx_probe_fill_cursor += vms->gfx_probe_fill_command_length;
++                    vms->gfx_probe_fill_tag += 256;
++                }
++                trace_vmapple_gfx_fill_complete(completed, fill.length);
++                if (completed) {
++                    vms->gfx_probe_stamp_pending |= 1 << 1;
++                    if (vms->gfx_probe_root_wake) {
++                        qemu_irq_pulse(qdev_get_gpio_in(vms->gic,
++                            vms->irqmap[VMAPPLE_APV_GFX]));
++                    }
++                }
++            }
++        }
++    }
++    for (unsigned pos = 0; pos + 4 <= size; pos += 4) {
++        trace_vmapple_gfx_segment_word(pos, ldl_le_p(segment + pos));
++    }
++}
++
++/* At most 32 distinct cursor pairs per channel, first ring page only. */
++static void gfx_probe_doorbell(VMAppleMachineState *vms, uint32_t id)
++{
++    uint32_t control_offset;
++    uint8_t control[20], header[12];
++    uint64_t shared, address;
++    uint32_t producer, consumer;
++    VMAppleGfxProbeChannel *channel;
++
++    if (id == 0 || id > VMAPPLE_GFX_PROBE_CHANNELS ||
++        !vmapple_gfx_probe_channel(id, &control_offset)) {
++        return;
++    }
++    channel = &vms->gfx_probe_channels[id - 1];
++    shared = (uint64_t)vms->gfx_probe_shared_page << 14;
++    if (!shared || !gfx_probe_ram_span(shared + control_offset, 20) ||
++        address_space_read(&address_space_memory, shared + control_offset,
++            MEMTXATTRS_UNSPECIFIED, control, 20) != MEMTX_OK) {
++        return;
++    }
++    producer = ldl_le_p(control);
++    consumer = ldl_le_p(control + 4);
++    if (id == 2) {
++        gfx_probe_process_lifecycle(vms, shared + control_offset);
++        gfx_probe_complete_task_prefix(vms, shared + control_offset);
++    }
++    /* Submission gating is also independent of the trace-observer quota.
++     * Inspect only the exact first single-segment shape; never consume it. */
++    if (id == 1 && vms->gfx_probe_task_lifecycle &&
++        consumer == vms->gfx_probe_fill_cursor && producer >= consumer &&
++        producer - consumer >= 64 && producer <= 16384 && channel->registered &&
++        gfx_probe_map_first_page(channel)) {
++        uint8_t command[72];
++        VMAppleGfxProbeHeader submission_header;
++        uint32_t length = producer - consumer >= 72 ? 72 : 64;
++        uint64_t command_address = channel->first_page_address + consumer;
++        if (gfx_probe_ram_span(command_address, length) &&
++            address_space_read(&address_space_memory, command_address,
++                MEMTXATTRS_UNSPECIFIED, command, length) == MEMTX_OK &&
++            vmapple_gfx_probe_decode(command, 12, producer - consumer, &submission_header) &&
++            submission_header.opcode == 55 &&
++            vms->gfx_probe_fill_tag <= UINT32_MAX - 256 &&
++            submission_header.tag == vms->gfx_probe_fill_tag + 256) {
++            vms->gfx_probe_fill_control = shared + control_offset;
++            vms->gfx_probe_fill_command_length = submission_header.length;
++            if (submission_header.length == 72 &&
++                submission_header.metadata_count == 1 && length == 72) {
++                gfx_probe_submission_segment(vms, command + 12);
++            } else if (submission_header.length == 64 &&
++                       !submission_header.metadata_count) {
++                uint8_t normalized[60];
++                /* No encoded dependency: retain the current completed prefix
++                 * as a conservative local gate, not guest metadata. */
++                stl_le_p(normalized, 2);
++                stl_le_p(normalized + 4, vms->gfx_probe_lifecycle_tag);
++                memcpy(normalized + 8, command + 12, 52);
++                gfx_probe_submission_segment(vms, normalized);
++            }
++            vms->gfx_probe_fill_control = 0;
++        }
++    }
++    if (id == 1 && vms->gfx_probe_task_lifecycle && producer >= consumer &&
++        producer - consumer == 88 && producer <= 16384 &&
++        channel->registered && gfx_probe_map_first_page(channel)) {
++        uint8_t texture_command[88];
++        VMAppleGfxProbeHeader shape;
++        uint64_t texture_address = channel->first_page_address + consumer;
++        if (gfx_probe_ram_span(texture_address, sizeof(texture_command)) &&
++            address_space_read(&address_space_memory, texture_address,
++                MEMTXATTRS_UNSPECIFIED, texture_command,
++                sizeof(texture_command)) == MEMTX_OK &&
++            vmapple_gfx_probe_decode(texture_command, 12, 88, &shape) &&
++            shape.opcode == 55 && shape.length == 88 && !shape.metadata_count) {
++            for (unsigned pos = 0; pos < sizeof(texture_command); pos += 4) {
++                trace_vmapple_gfx_texture_submission(pos,
++                    ldl_le_p(texture_command + pos));
++            }
++        }
++    }
++    /* The trace budget must not cap the independent metadata executor. */
++    if (vms->gfx_probe_doorbells[id - 1] >= 32) {
++        return;
++    }
++    if (vms->gfx_probe_last_producer[id - 1] == producer &&
++        vms->gfx_probe_last_consumer[id - 1] == consumer) {
++        return;
++    }
++    vms->gfx_probe_last_producer[id - 1] = producer;
++    vms->gfx_probe_last_consumer[id - 1] = consumer;
++    vms->gfx_probe_doorbells[id - 1]++;
++    trace_vmapple_gfx_channel_probe(id, producer, consumer,
++        ldl_le_p(control + 8), ldl_le_p(control + 12), ldl_le_p(control + 16));
++    if (!channel->registered || ldl_le_p(control + 16) != channel->page ||
++        !gfx_probe_map_first_page(channel) || consumer > 16384 - 12 ||
++        producer > 16384 || producer < consumer ||
++        (producer & 3) || (consumer & 3) || producer - consumer < 12) {
++        return;
++    }
++    bool registration_prefix = true;
++
++    for (unsigned command = 0; command < 64 && producer - consumer >= 12;
++         command++) {
++        address = channel->first_page_address + consumer;
++        if (gfx_probe_ram_span(address, sizeof(header)) &&
++            address_space_read(&address_space_memory, address,
++                MEMTXATTRS_UNSPECIFIED, header, sizeof(header)) == MEMTX_OK) {
++            VMAppleGfxProbeHeader decoded;
++
++            trace_vmapple_gfx_channel_header(id, producer, consumer,
++                ldl_le_p(header), ldl_le_p(header + 4), ldl_le_p(header + 8));
++            if (vmapple_gfx_probe_decode(header, sizeof(header), producer - consumer,
++                                         &decoded) &&
++                decoded.length <= 16384 - consumer) {
++                uint32_t start = 12 + decoded.metadata_count * 8;
++                uint32_t end = MIN(decoded.length, start + 32);
++
++                if (id == 1 && decoded.opcode == 55 &&
++                    decoded.metadata_count == 1 && decoded.length == 72) {
++                    uint8_t submission[60];
++
++                    if (gfx_probe_ram_span(address + 12, sizeof(submission)) &&
++                        address_space_read(&address_space_memory, address + 12,
++                            MEMTXATTRS_UNSPECIFIED, submission,
++                            sizeof(submission)) == MEMTX_OK) {
++                        gfx_probe_submission_segment(vms, submission);
++                        for (unsigned pos = 0; pos < sizeof(submission); pos += 4) {
++                            trace_vmapple_gfx_submission_word(pos + 12,
++                                ldl_le_p(submission + pos));
++                        }
++                    }
++                }
++
++                if (id == 2 && registration_prefix &&
++                    (decoded.opcode == 56 || decoded.opcode == 51)) {
++                    bool valid = gfx_probe_register_task_command(vms, &decoded,
++                                                                 address);
++
++                    trace_vmapple_gfx_task_registration(decoded.opcode, valid);
++                    registration_prefix = valid;
++                } else if (id == 2) {
++                    registration_prefix = false;
++                }
++
++                if (id == 4 && decoded.opcode == 1 &&
++                    decoded.metadata_count == 0 && decoded.length == 20 &&
++                    decoded.tag == 256 && consumer == 0) {
++                    uint8_t payload[8];
++                    uint64_t state;
++                    bool registered = false;
++
++                    if (address_space_read(&address_space_memory, address + 12,
++                            MEMTXATTRS_UNSPECIFIED, payload, 8) == MEMTX_OK &&
++                        ldl_le_p(payload) == 0 &&
++                        vmapple_gfx_probe_page_address(ldl_le_p(payload + 4),
++                                                       &state) &&
++                        gfx_probe_ram_span(state, 16384) &&
++                        (!vms->gfx_probe_display_state_valid ||
++                         vms->gfx_probe_display_state == state)) {
++                        vms->gfx_probe_display_state = state;
++                        vms->gfx_probe_display_state_valid = true;
++                        registered = true;
++                    }
++                    trace_vmapple_gfx_display_state(registered);
++                    if (registered) {
++                        gfx_probe_complete_display(vms, shared + control_offset);
++                    }
++                }
++                if (id == 4 && consumer == 20 && decoded.opcode == 2 &&
++                    decoded.metadata_count == 0 && decoded.length == 20 &&
++                    decoded.tag == 512) {
++                    gfx_probe_ack_display_revision(vms, shared + control_offset,
++                                                    address);
++                }
++                for (uint32_t pos = start; pos < end; pos += 4) {
++                    uint32_t word;
++
++                    if (!gfx_probe_read_entry(NULL, address + pos, &word)) {
++                        break;
++                    }
++                    trace_vmapple_gfx_channel_payload(id, decoded.opcode,
++                                                     pos - start, word);
++                }
++                consumer += decoded.length;
++            } else {
++                break;
++            }
++        } else {
++            break;
++        }
++    }
+ }
+ 
+ static void gfx_stub_write(void *opaque, hwaddr offset, uint64_t value,
+                            unsigned size)
+ {
++    VMAppleMachineState *vms = opaque;
++
++#ifdef CONFIG_VMAPPLE_REIMS
++    if (vms->gfx_reims && !vms->reims_device) {
++        reims_init(vms);
++    }
++    if (vms->reims_device) {
++        gfx_probe(vms, 0, true, offset, size, value);
++        rvg_device_mmio_write(vms->reims_device, offset, value);
++        return;
++    }
++#endif
++    if (vms->gfx_probe_readback && offset == 0x1034 && size == 4) {
++        vms->gfx_probe_config = value;
++    }
++    if (vms->gfx_probe_readback && size == 4) {
++        switch (offset) {
++        case 0x101c:
++            vms->gfx_probe_shared_page = value;
++            vms->gfx_probe_display_state_valid = false;
++            vms->gfx_probe_display_state = 0;
++            memset(&vms->gfx_probe_root_prefix, 0,
++                   sizeof(vms->gfx_probe_root_prefix));
++            memset(vms->gfx_probe_heaps, 0, sizeof(vms->gfx_probe_heaps));
++            memset(vms->gfx_probe_address_space_valid, 0,
++                   sizeof(vms->gfx_probe_address_space_valid));
++            memset(vms->gfx_probe_address_spaces, 0,
++                   sizeof(vms->gfx_probe_address_spaces));
++            vms->gfx_probe_query_pending = false;
++            memset(&vms->gfx_probe_pending_query, 0,
++                   sizeof(vms->gfx_probe_pending_query));
++            memset(vms->gfx_probe_channels, 0,
++                   sizeof(vms->gfx_probe_channels));
++            break;
++        case 0x1030:
++            vms->gfx_probe_fifo_page = value;
++            vms->gfx_probe_cursor = 0;
++            break;
++        case 0x1004:
++            vms->gfx_probe_fifo_size = value;
++            break;
++        case 0x1020:
++            gfx_probe_doorbell(vms, value);
++            break;
++        case 0x1008:
++            gfx_probe_fifo(vms, value);
++            break;
++        }
++    }
++    gfx_probe(vms, 0, true, offset, size, value);
++}
++
++/* Only the first 16 KiB descriptor page is supported initially. */
++static bool iosfc_probe_map(VMAppleMachineState *vms, uint32_t id)
++{
++    uint32_t directory_entry, root, size;
++    uint64_t page, offset;
++    uint8_t descriptor[512];
++    unsigned slot;
++
++    if (id >= 32 || !vms->iosfc_probe_directory ||
++        (vms->iosfc_probe_directory & 16383) ||
++        !gfx_probe_read_entry(NULL, vms->iosfc_probe_directory,
++                              &directory_entry) || !(directory_entry & 1)) {
++        return false;
++    }
++    page = (uint64_t)(directory_entry >> 2) << 14;
++    if (!page || !gfx_probe_ram_span(page, 16384) ||
++        address_space_read(&address_space_memory, page + id * 512,
++                           MEMTXATTRS_UNSPECIFIED, descriptor,
++                           sizeof(descriptor)) != MEMTX_OK) {
++        return false;
++    }
++    root = ldl_le_p(descriptor);
++    size = ldl_le_p(descriptor + 16);
++    if (!size || size > 16 * 1024 * 1024) {
++        return false;
++    }
++    for (offset = 0; offset < size; offset += 16384) {
++        uint64_t physical;
++
++        if (!vmapple_gfx_probe_backing(root, size, offset,
++                gfx_probe_read_entry, NULL, &physical) ||
++            !gfx_probe_ram_span(physical, MIN(UINT64_C(16384), size - offset))) {
++            return false;
++        }
++    }
++    for (slot = 0; slot < ARRAY_SIZE(vms->iosfc_probe_mappings); slot++) {
++        if (vms->iosfc_probe_mappings[slot].valid &&
++            vms->iosfc_probe_mappings[slot].id == id) {
++            return vms->iosfc_probe_mappings[slot].root == root &&
++                   vms->iosfc_probe_mappings[slot].size == size;
++        }
++    }
++    for (slot = 0; slot < ARRAY_SIZE(vms->iosfc_probe_mappings); slot++) {
++        if (!vms->iosfc_probe_mappings[slot].valid) {
++            vms->iosfc_probe_mappings[slot].valid = true;
++            vms->iosfc_probe_mappings[slot].id = id;
++            vms->iosfc_probe_mappings[slot].root = root;
++            vms->iosfc_probe_mappings[slot].size = size;
++            return true;
++        }
++    }
++    return false;
++}
++
++static uint64_t iosfc_stub_read(void *opaque, hwaddr offset, unsigned size)
++{
++#ifdef CONFIG_VMAPPLE_REIMS
++    VMAppleMachineState *vms = opaque;
++    if (vms->gfx_reims && !vms->reims_surface) {
++        reims_init(vms);
++    }
++    if (vms->reims_surface) {
++        return rvg_iosurface_device_mmio_read(vms->reims_surface, offset);
++    }
++#endif
++    gfx_probe(opaque, 1, false, offset, size, 0);
++    return 0;
++}
++
++static void iosfc_stub_write(void *opaque, hwaddr offset, uint64_t value,
++                             unsigned size)
++{
++    VMAppleMachineState *vms = opaque;
++
++#ifdef CONFIG_VMAPPLE_REIMS
++    if (vms->gfx_reims && !vms->reims_surface) {
++        reims_init(vms);
++    }
++    if (vms->reims_surface) {
++        rvg_iosurface_device_mmio_write(vms->reims_surface, offset, value);
++        return;
++    }
++#endif
++    if (vms->gfx_probe_readback && size == 8) {
++        if (offset == 0x1000) {
++            vms->iosfc_probe_directory = value;
++        } else if (offset == 0x1010) {
++            vms->iosfc_probe_ring = value;
++        } else if (offset == 0x1008) {
++            vms->iosfc_probe_capacity = value;
++        } else if (offset == 0x1018 && value &&
++                   vms->iosfc_probe_records < 8) {
++            uint64_t address;
++            uint8_t record[16];
++
++            if (vmapple_gfx_probe_iosfc_slot(vms->iosfc_probe_ring,
++                    vms->iosfc_probe_capacity, 0, value, &address) &&
++                gfx_probe_ram_span(address, sizeof(record)) &&
++                address_space_read(&address_space_memory, address,
++                    MEMTXATTRS_UNSPECIFIED, record, sizeof(record)) == MEMTX_OK) {
++                bool mapped = ldl_le_p(record) == 1 &&
++                    iosfc_probe_map(vms, ldl_le_p(record + 4));
++
++                vms->iosfc_probe_records++;
++                trace_vmapple_iosfc_mapping(mapped);
++                trace_vmapple_iosfc_record(value, ldl_le_p(record),
++                                           ldl_le_p(record + 4));
++            }
++        }
++    }
++    gfx_probe(opaque, 1, true, offset, size, value);
+ }
+ 
+ static const MemoryRegionOps gfx_stub_ops = {
+@@ -255,6 +1806,14 @@ static const MemoryRegionOps gfx_stub_ops = {
+         .max_access_size = 8,
+     },
+ };
++
++static const MemoryRegionOps iosfc_stub_ops = {
++    .read = iosfc_stub_read,
++    .write = iosfc_stub_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .valid = { .min_access_size = 4, .max_access_size = 8 },
++    .impl = { .min_access_size = 4, .max_access_size = 8 },
++};
+ #endif
+ 
+ static void create_gfx(VMAppleMachineState *vms, MemoryRegion *mem)
+@@ -276,10 +1835,18 @@ static void create_gfx(VMAppleMachineState *vms, MemoryRegion *mem)
+      * built without a host graphics backend.  Keep them mapped as inert
+      * devices so probing a headless VM cannot raise an external abort.
+      */
++    if (vms->gfx_reims) {
++#ifdef CONFIG_VMAPPLE_REIMS
++        /* Initialize on first MMIO, after boot protection commits. */
++#else
++        error_report("Reims backend unavailable: rebuild with reims-vgpu pkg-config package");
++        exit(EXIT_FAILURE);
++#endif
++    }
+     memory_region_init_io(&vms->gfx_stub_mr, OBJECT(vms), &gfx_stub_ops, vms,
+                           "vmapple.gfx-stub",
+                           vms->memmap[VMAPPLE_APV_GFX].size);
+-    memory_region_init_io(&vms->iosfc_stub_mr, OBJECT(vms), &gfx_stub_ops, vms,
++    memory_region_init_io(&vms->iosfc_stub_mr, OBJECT(vms), &iosfc_stub_ops, vms,
+                           "vmapple.iosfc-stub",
+                           vms->memmap[VMAPPLE_APV_IOSFC].size);
+     memory_region_add_subregion(mem, vms->memmap[VMAPPLE_APV_GFX].base,
+@@ -577,6 +2144,8 @@ static void vmapple_reset(void *opaque)
+     VMAppleMachineState *vms = opaque;
+     hwaddr base = vms->memmap[VMAPPLE_FIRMWARE].base;
+ 
++    vms->recovery_platform_control = 0;
++    vms->recovery_platform_mask = 0;
+     cpu_set_pc(first_cpu, base);
+ }
+ 
+@@ -637,6 +2206,11 @@ static void vmapple_set_tcg_smp_final_shift(Object *obj, Visitor *v,
+ 
+ static void mach_vmapple_init(MachineState *machine)
+ {
++    ARMPACKey pac_defaults[5];
++    uint64_t pac_ids[2];
++
++    qemu_guest_getrandom_nofail(pac_defaults, sizeof(pac_defaults));
++    qemu_guest_getrandom_nofail(pac_ids, sizeof(pac_ids));
+     VMAppleMachineState *vms = VMAPPLE_MACHINE(machine);
+     MachineClass *mc = MACHINE_GET_CLASS(machine);
+     const CPUArchIdList *possible_cpus;
+@@ -645,11 +2219,6 @@ static void mach_vmapple_init(MachineState *machine)
+     unsigned int smp_cpus = machine->smp.cpus;
+     unsigned int max_cpus = machine->smp.max_cpus;
+ 
+-    ARMPACKey pac_defaults[5];
+-    uint64_t pac_ids[2];
+-
+-    qemu_guest_getrandom_nofail(pac_defaults, sizeof(pac_defaults));
+-    qemu_guest_getrandom_nofail(pac_ids, sizeof(pac_ids));
+     vms->memmap = memmap;
+     machine->usb = true;
+ 
+@@ -669,6 +2238,10 @@ static void mach_vmapple_init(MachineState *machine)
+ 
+         if (tcg_enabled()) {
+             ARMCPU *arm_cpu = ARM_CPU(cpu);
++            memcpy(arm_cpu->experimental_pac_defaults, pac_defaults,
++                   sizeof(pac_defaults));
++            memcpy(arm_cpu->experimental_pac_default_ids, pac_ids, sizeof(pac_ids));
++            arm_cpu->experimental_pac_defaults_valid = true;
+             uint64_t isar1 = GET_IDREG(&arm_cpu->isar, ID_AA64ISAR1);
+ 
+             /*
+@@ -679,10 +2252,6 @@ static void mach_vmapple_init(MachineState *machine)
+             isar1 = FIELD_DP64(isar1, ID_AA64ISAR1, APA, 1);
+             isar1 = FIELD_DP64(isar1, ID_AA64ISAR1, API, 1);
+             SET_IDREG(&arm_cpu->isar, ID_AA64ISAR1, isar1);
+-            memcpy(arm_cpu->experimental_pac_defaults, pac_defaults,
+-                   sizeof(pac_defaults));
+-            memcpy(arm_cpu->experimental_pac_default_ids, pac_ids, sizeof(pac_ids));
+-            arm_cpu->experimental_pac_defaults_valid = true;
+             arm_cpu->pauth_impdef_compat = !arm_cpu->experimental_pac_init;
+             object_property_set_int(cpu, "cntfrq", VMAPPLE_TIMEBASE_HZ,
+                                     &error_fatal);
+@@ -717,6 +2286,43 @@ static void mach_vmapple_init(MachineState *machine)
+     memory_region_add_subregion(sysmem, vms->memmap[VMAPPLE_MEM].base,
+                                 machine->ram);
+ 
++    /* Reims lazily freezes the writable RAM complement on first MMIO. */
++    if (vms->recovery_protection) {
++        vms->diagnostic_range_banks = true;
++        vms->diagnostic_bank_page_upper = true;
++    }
++    if (vms->diagnostic_ro_size || vms->diagnostic_range_banks) {
++        error_setg(&vms->diagnostic_protection_migration_blocker,
++                   "Experimental protection mappings lack migration state; "
++                   "disable diagnostic protection or implement state migration");
++        migrate_add_blocker(&vms->diagnostic_protection_migration_blocker,
++                            &error_fatal);
++    }
++
++    if (vms->diagnostic_ro_size) {
++        uint64_t base = vms->memmap[VMAPPLE_MEM].base;
++        uint64_t offset = vms->diagnostic_ro_start - base;
++
++        if (vms->diagnostic_ro_start < base ||
++            offset >= machine->ram_size ||
++            vms->diagnostic_ro_size > machine->ram_size - offset ||
++            (vms->diagnostic_ro_start & 0x3fff) ||
++            (vms->diagnostic_ro_size & 0x3fff)) {
++            error_report("diagnostic read-only range must cover whole RAM pages");
++            exit(EXIT_FAILURE);
++        }
++        /* A distinct RAM region is required: alias readonly flags alone do not
++         * stop address_space_write from resolving the original writable RAM.
++         * Shares bytes, not a snapshot; no guest-visible CTRR claims. */
++        memory_region_init_ram_ptr(&vms->diagnostic_ro_mr, NULL,
++                                   "vmapple-diagnostic-ro", vms->diagnostic_ro_size,
++                                   (uint8_t *)memory_region_get_ram_ptr(machine->ram) + offset);
++        memory_region_set_readonly(&vms->diagnostic_ro_mr, true);
++        memory_region_add_subregion_overlap(sysmem, vms->diagnostic_ro_start,
++                                            &vms->diagnostic_ro_mr, 1);
++        vms->diagnostic_ro_initialized = true;
++    }
++
+     if (vms->recovery_shared_page) {
+         /* Storage only: guest owns all contents and protocol state. */
+         memory_region_init_ram(&vms->recovery_shared_mr, NULL,
+@@ -732,12 +2338,6 @@ static void mach_vmapple_init(MachineState *machine)
+     create_gfx(vms, sysmem);
+     create_uart(vms, VMAPPLE_UART, sysmem, serial_hd(0));
+     create_rtc(vms);
+-    if (vms->recovery_protection) {
+-        error_setg(&vms->diagnostic_protection_migration_blocker,
+-                   "VMApple recovery protection lacks migration state");
+-        migrate_add_blocker(&vms->diagnostic_protection_migration_blocker,
+-                            &error_fatal);
+-    }
+     create_diagnostic_banks(vms);
+     create_pcie(vms);
+ 
+@@ -767,6 +2367,12 @@ static void mach_vmapple_init(MachineState *machine)
+     arm_load_kernel(ARM_CPU(first_cpu), machine, &vms->bootinfo);
+ 
+     qemu_register_reset(vmapple_reset, vms);
++
++#ifdef CONFIG_VMAPPLE_REIMS
++    if (vms->gfx_reims) {
++        reims_console_preinit(vms);
++    }
++#endif
+ }
+ 
+ static CpuInstanceProperties
+@@ -850,19 +2456,54 @@ static bool vmapple_get_recovery_protection(Object *obj, Error **errp)
+     return VMAPPLE_MACHINE(obj)->recovery_protection;
+ }
+ 
+-static void vmapple_set_recovery_protection(Object *obj, bool value,
+-                                             Error **errp)
++static void vmapple_set_recovery_protection(Object *obj, bool value, Error **errp)
+ {
+     VMAPPLE_MACHINE(obj)->recovery_protection = value;
+ }
+ 
++static bool vmapple_get_diagnostic_bank_page_upper(Object *obj, Error **errp)
++{
++    return VMAPPLE_MACHINE(obj)->diagnostic_bank_page_upper;
++}
++
++static void vmapple_set_diagnostic_bank_page_upper(Object *obj, bool value, Error **errp)
++{
++    VMAPPLE_MACHINE(obj)->diagnostic_bank_page_upper = value;
++}
++
++static bool vmapple_get_diagnostic_range_banks(Object *obj, Error **errp)
++{
++    return VMAPPLE_MACHINE(obj)->diagnostic_range_banks;
++}
++
++static void vmapple_set_diagnostic_range_banks(Object *obj, bool value, Error **errp)
++{
++    VMAPPLE_MACHINE(obj)->diagnostic_range_banks = value;
++}
++
++static bool vmapple_get_diagnostic_ro_enabled(Object *obj, Error **errp)
++{
++    VMAppleMachineState *vms = VMAPPLE_MACHINE(obj);
++    return vms->diagnostic_ro_initialized &&
++           vms->diagnostic_ro_mr.enabled;
++}
++
++static void vmapple_set_diagnostic_ro_enabled(Object *obj, bool value, Error **errp)
++{
++    VMAppleMachineState *vms = VMAPPLE_MACHINE(obj);
++    if (!vms->diagnostic_ro_initialized) {
++        error_setg(errp, "Configure diagnostic-ro-start/size before toggling view");
++        return;
++    }
++    memory_region_set_enabled(&vms->diagnostic_ro_mr, value);
++}
++
+ static bool vmapple_get_recovery_rtc_selector(Object *obj, Error **errp)
+ {
+     return VMAPPLE_MACHINE(obj)->recovery_rtc_selector;
+ }
+ 
+-static void vmapple_set_recovery_rtc_selector(Object *obj, bool value,
+-                                              Error **errp)
++static void vmapple_set_recovery_rtc_selector(Object *obj, bool value, Error **errp)
+ {
+     VMAPPLE_MACHINE(obj)->recovery_rtc_selector = value;
+ }
+@@ -892,6 +2533,98 @@ static void vmapple_instance_init(Object *obj)
+     VMAppleMachineState *vms = VMAPPLE_MACHINE(obj);
+ 
+     vms->irqmap = irqmap;
++#ifdef CONFIG_VMAPPLE_REIMS
++    object_property_add_str(obj, "reims-frame-snapshot",
++                            reims_frame_snapshot, NULL);
++#endif
++    /* Host cleanup budget, not a guest-runtime limit. Zero selects nonblocking. */
++    vms->reims_terminal_wait_ns = 30ULL * NANOSECONDS_PER_SECOND;
++    object_property_add_uint64_ptr(obj, "reims-terminal-wait-ns",
++                                   &vms->reims_terminal_wait_ns,
++                                   OBJ_PROP_FLAG_READWRITE);
++    object_property_add_uint64_ptr(obj, "reims-display-identity-seed",
++                                   &vms->reims_display_identity_seed,
++                                   OBJ_PROP_FLAG_READWRITE);
++    vms->reims_display_count = 1;
++    object_property_add_uint64_ptr(obj, "reims-display-count",
++                                   &vms->reims_display_count,
++                                   OBJ_PROP_FLAG_READWRITE);
++    vms->reims_mode_width = 1024;
++    vms->reims_mode_height = 768;
++    vms->reims_mode_refresh_hz = 60;
++    object_property_add_uint64_ptr(obj, "reims-mode-width",
++                                   &vms->reims_mode_width,
++                                   OBJ_PROP_FLAG_READWRITE);
++    object_property_add_uint64_ptr(obj, "reims-mode-height",
++                                   &vms->reims_mode_height,
++                                   OBJ_PROP_FLAG_READWRITE);
++    object_property_add_uint64_ptr(obj, "reims-mode-refresh-hz",
++                                   &vms->reims_mode_refresh_hz,
++                                   OBJ_PROP_FLAG_READWRITE);
++
++    object_property_add_uint64_ptr(obj, "gfx-probe-task-lifecycle",
++                                   &vms->gfx_probe_task_lifecycle,
++                                   OBJ_PROP_FLAG_READWRITE);
++    object_property_set_description(obj, "gfx-probe-task-lifecycle",
++        "Process bounded ordered task, heap, resource deletion and task release metadata");
++    object_property_add_uint64_ptr(obj, "gfx-probe-task-prefix",
++                                   &vms->gfx_probe_task_prefix,
++                                   OBJ_PROP_FLAG_READWRITE);
++    object_property_set_description(obj, "gfx-probe-task-prefix",
++        "Complete only verified initial task and heap definitions, stopping before deletion");
++    object_property_add_uint64_ptr(obj, "gfx-probe-fill-complete",
++                                   &vms->gfx_probe_fill_complete,
++                                   OBJ_PROP_FLAG_READWRITE);
++    object_property_set_description(obj, "gfx-probe-fill-complete",
++        "Execute and complete one dependency-gated verified buffer fill");
++    object_property_add_uint64_ptr(obj, "gfx-probe-fill-effect",
++                                   &vms->gfx_probe_fill_effect,
++                                   OBJ_PROP_FLAG_READWRITE);
++    object_property_set_description(obj, "gfx-probe-fill-effect",
++        "Diagnostic single fill side effect without dependency scheduling or completion");
++    object_property_add_uint64_ptr(obj, "gfx-probe-display-event",
++                                   &vms->gfx_probe_display_event,
++                                   OBJ_PROP_FLAG_READWRITE);
++    object_property_set_description(obj, "gfx-probe-display-event",
++        "Deliver enabled timing event on GPU status read (default off)");
++
++    object_property_add_uint64_ptr(obj, "gfx-probe-display-mode",
++                                   &vms->gfx_probe_display_mode,
++                                   OBJ_PROP_FLAG_READWRITE);
++    object_property_set_description(obj, "gfx-probe-display-mode",
++        "Publish one diagnostic display timing, not scanout (default off)");
++
++    object_property_add_uint64_ptr(obj, "gfx-probe-display-complete",
++                                   &vms->gfx_probe_display_complete,
++                                   OBJ_PROP_FLAG_READWRITE);
++    object_property_set_description(obj, "gfx-probe-display-complete",
++        "Register one disconnected display state (default off)");
++
++    object_property_add_uint64_ptr(obj, "gfx-probe-root-wake",
++                                   &vms->gfx_probe_root_wake,
++                                   OBJ_PROP_FLAG_READWRITE);
++    object_property_set_description(obj, "gfx-probe-root-wake",
++        "Pulse GPU IRQ for one verified root stamp (default off)");
++
++    object_property_add_uint64_ptr(obj, "gfx-probe-root-complete",
++                                   &vms->gfx_probe_root_complete,
++                                   OBJ_PROP_FLAG_READWRITE);
++    object_property_set_description(obj, "gfx-probe-root-complete",
++        "Complete one strictly handled initialization prefix (default off)");
++
++    object_property_add_uint64_ptr(obj, "gfx-probe-response-write",
++                                   &vms->gfx_probe_response_write,
++                                   OBJ_PROP_FLAG_READWRITE);
++    object_property_set_description(obj, "gfx-probe-response-write",
++        "Diagnostic empty response write without completion (default off)");
++
++    object_property_add_uint64_ptr(obj, "gfx-reims", &vms->gfx_reims,
++                                   OBJ_PROP_FLAG_READWRITE);
++    object_property_add_uint64_ptr(obj, "gfx-probe-readback",
++                                   &vms->gfx_probe_readback,
++                                   OBJ_PROP_FLAG_READWRITE);
++    object_property_set_description(obj, "gfx-probe-readback",
++        "Experimental graphics configuration readback (default off)");
+ 
+     object_property_add_uint64_ptr(obj, "uuid", &vms->uuid,
+                                    OBJ_PROP_FLAG_READWRITE);
+@@ -900,9 +2633,36 @@ static void vmapple_instance_init(Object *obj)
+     object_property_add_bool(obj, "recovery-protection",
+                              vmapple_get_recovery_protection,
+                              vmapple_set_recovery_protection);
++    object_property_set_description(obj, "recovery-protection",
++        "Experimental enforced recovery range protection (default off; no migration)");
++
++    object_property_add_bool(obj, "diagnostic-bank-page-upper",
++                             vmapple_get_diagnostic_bank_page_upper,
++                             vmapple_set_diagnostic_bank_page_upper);
++
++    object_property_add_bool(obj, "diagnostic-range-banks",
++                             vmapple_get_diagnostic_range_banks,
++                             vmapple_set_diagnostic_range_banks);
++
++    object_property_add_bool(obj, "diagnostic-ro-enabled",
++                             vmapple_get_diagnostic_ro_enabled,
++                             vmapple_set_diagnostic_ro_enabled);
++    object_property_set_description(obj, "diagnostic-ro-enabled",
++        "Host-only runtime toggle for configured diagnostic view (not CTRR lock)");
++
++    object_property_add_uint64_ptr(obj, "diagnostic-ro-start",
++                                   &vms->diagnostic_ro_start, OBJ_PROP_FLAG_READWRITE);
++    object_property_add_uint64_ptr(obj, "diagnostic-ro-size",
++                                   &vms->diagnostic_ro_size, OBJ_PROP_FLAG_READWRITE);
++    object_property_set_description(obj, "diagnostic-ro-size",
++        "Host diagnostic read-only RAM view size (zero disables; not CTRR)");
++
+     object_property_add_bool(obj, "recovery-rtc-selector",
+                              vmapple_get_recovery_rtc_selector,
+                              vmapple_set_recovery_rtc_selector);
++    object_property_set_description(obj, "recovery-rtc-selector",
++        "Local PL031 RTC selection compatibility window (default off)");
++
+     object_property_add_bool(obj, "recovery-shared-page",
+                              vmapple_get_recovery_shared_page,
+                              vmapple_set_recovery_shared_page);
+@@ -932,8 +2692,24 @@ static const TypeInfo vmapple_machine_info = {
+     .interfaces    = aarch64_machine_interfaces,
+ };
+ 
++/* Separate experimental machine identity: never change the default granule. */
++static void vmapple_page16k_class_init(ObjectClass *oc, const void *data)
++{
++    MachineClass *mc = MACHINE_CLASS(oc);
++
++    mc->minimum_page_bits = 14;
++    mc->desc = "Experimental VMApple with fixed 16 KiB target pages";
++}
++
++static const TypeInfo vmapple_page16k_info = {
++    .name = MACHINE_TYPE_NAME("vmapple-page16k"),
++    .parent = TYPE_VMAPPLE_MACHINE,
++    .class_init = vmapple_page16k_class_init,
++};
++
+ static void machvmapple_machine_init(void)
+ {
+     type_register_static(&vmapple_machine_info);
++    type_register_static(&vmapple_page16k_info);
+ }
+ type_init(machvmapple_machine_init);
+diff --git a/include/hw/vmapple/gfx-probe.h b/include/hw/vmapple/gfx-probe.h
+new file mode 100644
+index 00000000..61913eef
+--- /dev/null
++++ b/include/hw/vmapple/gfx-probe.h
+@@ -0,0 +1,705 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++#ifndef HW_VMAPPLE_GFX_PROBE_H
++#define HW_VMAPPLE_GFX_PROBE_H
++
++#include <stdbool.h>
++#include <stdint.h>
++#include <stddef.h>
++
++/* Diagnostic cursor only: never exposed as a guest completion counter.
++ * This first observer deliberately rejects wrap and counter rollover.
++ */
++static inline bool vmapple_gfx_probe_span(uint32_t capacity, uint32_t cursor,
++                                          uint32_t producer, uint32_t length)
++{
++    return capacity >= 12 && capacity <= 1024 * 1024 &&
++           cursor <= producer && producer <= capacity &&
++           !(cursor & 3) && !(producer & 3) && !(length & 3) &&
++           length >= 12 && length <= producer - cursor;
++}
++
++typedef struct VMAppleGfxProbeHeader {
++    uint16_t opcode;
++    uint16_t metadata_count;
++    uint32_t length;
++    uint32_t tag;
++} VMAppleGfxProbeHeader;
++
++static inline uint32_t vmapple_gfx_probe_le32(const uint8_t *p)
++{
++    return (uint32_t)p[0] | (uint32_t)p[1] << 8 |
++           (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
++}
++
++/* Supported submission payload includes one dependency and one segment. */
++static inline bool vmapple_gfx_probe_single_submission(const uint8_t *p,
++    size_t size, uint32_t completed, uint32_t guest_stamp)
++{
++    if (!p || size != 60 || !completed || guest_stamp != completed ||
++        vmapple_gfx_probe_le32(p) != 2 ||
++        !vmapple_gfx_probe_le32(p + 4) ||
++        (vmapple_gfx_probe_le32(p + 4) & 255) ||
++        vmapple_gfx_probe_le32(p + 4) > completed ||
++        !vmapple_gfx_probe_le32(p + 8) ||
++        vmapple_gfx_probe_le32(p + 12) != 1 ||
++        vmapple_gfx_probe_le32(p + 16) != 1 ||
++        vmapple_gfx_probe_le32(p + 20) != 1) {
++        return false;
++    }
++    for (unsigned offset = 24; offset < 44; offset += 4) {
++        if (vmapple_gfx_probe_le32(p + offset)) {
++            return false;
++        }
++    }
++    return (vmapple_gfx_probe_le32(p + 44) ||
++            vmapple_gfx_probe_le32(p + 48)) &&
++           vmapple_gfx_probe_le32(p + 52) == 40 &&
++           !vmapple_gfx_probe_le32(p + 56);
++}
++
++typedef struct VMAppleGfxProbeResourceDelete {
++    uint32_t task;
++    uint32_t resource;
++} VMAppleGfxProbeResourceDelete;
++
++/* Host resource deletion, not generic device object deletion or task release. */
++static inline bool vmapple_gfx_probe_resource_delete(
++    const VMAppleGfxProbeHeader *header, const uint8_t *payload, size_t size,
++    VMAppleGfxProbeResourceDelete *out)
++{
++    if (!header || !payload || !out || header->opcode != 37 ||
++        header->metadata_count || header->length != 20 || size != 8) {
++        return false;
++    }
++    out->task = vmapple_gfx_probe_le32(payload);
++    out->resource = vmapple_gfx_probe_le32(payload + 4);
++    return out->task && out->resource;
++}
++
++/* Keyed state: task ids are protocol values, never array indices. */
++#define VMAPPLE_GFX_LIFECYCLE_TASKS 32
++#define VMAPPLE_GFX_LIFECYCLE_DELETIONS 64
++typedef struct VMAppleGfxTaskLifetime {
++    uint32_t id, generation;
++    uint64_t root, heap, extent;
++    uint32_t heap_size;
++    bool live, mapper;
++} VMAppleGfxTaskLifetime;
++typedef struct VMAppleGfxLifecycle {
++    VMAppleGfxTaskLifetime tasks[VMAPPLE_GFX_LIFECYCLE_TASKS];
++    VMAppleGfxProbeResourceDelete deleted[VMAPPLE_GFX_LIFECYCLE_DELETIONS];
++    unsigned deleted_count;
++} VMAppleGfxLifecycle;
++
++static inline VMAppleGfxTaskLifetime *vmapple_gfx_lifetime_find(
++    VMAppleGfxLifecycle *state, uint32_t id)
++{
++    if (!state || !id) {
++        return NULL;
++    }
++    for (unsigned i = 0; i < VMAPPLE_GFX_LIFECYCLE_TASKS; i++) {
++        if (state->tasks[i].id == id) {
++            return &state->tasks[i];
++        }
++    }
++    return NULL;
++}
++
++/* Pure state transition only; callers validate RAM and persist completion. */
++static inline bool vmapple_gfx_lifetime_apply(VMAppleGfxLifecycle *state,
++    const VMAppleGfxProbeHeader *h, const uint8_t *p, size_t size)
++{
++    VMAppleGfxTaskLifetime *task;
++    uint32_t id;
++    if (!state || !h || !p || h->metadata_count || size < 4 ||
++        h->length != size + 12) {
++        return false;
++    }
++    id = vmapple_gfx_probe_le32(p);
++    if (h->opcode == 56) {
++        uint64_t root, extent;
++        if (size != 16 || !(id >> 1)) {
++            return false;
++        }
++        id >>= 1;
++        root = (uint64_t)vmapple_gfx_probe_le32(p + 12) << 14;
++        extent = vmapple_gfx_probe_le32(p + 4) |
++                 (uint64_t)vmapple_gfx_probe_le32(p + 8) << 32;
++        if (!root || !extent) {
++            return false;
++        }
++        task = vmapple_gfx_lifetime_find(state, id);
++        if (!task) {
++            for (unsigned i = 0; i < VMAPPLE_GFX_LIFECYCLE_TASKS; i++) {
++                if (!state->tasks[i].id) {
++                    task = &state->tasks[i];
++                    break;
++                }
++            }
++        }
++        if (!task || task->live || task->generation == UINT32_MAX) {
++            return false;
++        }
++        *task = (VMAppleGfxTaskLifetime){.id = id,
++            .generation = task->generation + 1, .root = root, .extent = extent,
++            .live = true, .mapper = (vmapple_gfx_probe_le32(p) & 1) != 0};
++        return true;
++    }
++    task = vmapple_gfx_lifetime_find(state, id);
++    if (!task || !task->live) {
++        return false;
++    }
++    if (h->opcode == 51 && size == 12) {
++        uint64_t heap = (uint64_t)vmapple_gfx_probe_le32(p + 4) << 14;
++        uint32_t length = vmapple_gfx_probe_le32(p + 8);
++        if (!heap || !length || length > 16 * 1024 * 1024 || task->heap) {
++            return false;
++        }
++        task->heap = heap;
++        task->heap_size = length;
++        return true;
++    }
++    if (h->opcode == 37 && size == 8) {
++        VMAppleGfxProbeResourceDelete deletion;
++        if (!vmapple_gfx_probe_resource_delete(h, p, size, &deletion) ||
++            state->deleted_count == VMAPPLE_GFX_LIFECYCLE_DELETIONS) {
++            return false;
++        }
++        for (unsigned i = 0; i < state->deleted_count; i++) {
++            if (state->deleted[i].task == id &&
++                state->deleted[i].resource == deletion.resource) {
++                return false;
++            }
++        }
++        state->deleted[state->deleted_count++] = deletion;
++        return true;
++    }
++    if (h->opcode == 32 && size == 4) {
++        for (unsigned i = 0; i < state->deleted_count;) {
++            if (state->deleted[i].task == id) {
++                state->deleted[i] = state->deleted[--state->deleted_count];
++            } else {
++                i++;
++            }
++        }
++        task->live = false;
++        task->root = task->heap = task->extent = task->heap_size = 0;
++        task->mapper = false;
++        return true;
++    }
++    return false;
++}
++
++typedef struct VMAppleGfxProbeFill {
++    uint32_t resource;
++    uint64_t offset;
++    uint64_t length;
++    uint8_t value;
++} VMAppleGfxProbeFill;
++
++/* Minimal software execution candidate, not permission to access guest memory. */
++static inline bool vmapple_gfx_probe_fill(const uint8_t *bytes, size_t size,
++    uint64_t extent, VMAppleGfxProbeFill *out)
++{
++    VMAppleGfxProbeFill fill;
++    uint32_t value;
++
++    if (!bytes || !out || size != 40 ||
++        vmapple_gfx_probe_le32(bytes) != 40 ||
++        vmapple_gfx_probe_le32(bytes + 4) != 2 ||
++        vmapple_gfx_probe_le32(bytes + 8) != 0x132 ||
++        vmapple_gfx_probe_le32(bytes + 12) != 32) {
++        return false;
++    }
++    fill.resource = vmapple_gfx_probe_le32(bytes + 16);
++    fill.offset = vmapple_gfx_probe_le32(bytes + 20) |
++                  (uint64_t)vmapple_gfx_probe_le32(bytes + 24) << 32;
++    fill.length = vmapple_gfx_probe_le32(bytes + 28) |
++                  (uint64_t)vmapple_gfx_probe_le32(bytes + 32) << 32;
++    value = vmapple_gfx_probe_le32(bytes + 36);
++    if (!fill.resource || !fill.length || fill.length > 4096 || value > 255 ||
++        fill.offset > extent || fill.length > extent - fill.offset) {
++        return false;
++    }
++    fill.value = value;
++    *out = fill;
++    return true;
++}
++
++/* Decode only the fixed header. Unknown opcode/tag semantics remain opaque.
++ * On failure leave the caller's output unchanged.
++ */
++static inline bool vmapple_gfx_probe_decode(const uint8_t *bytes, size_t size,
++                                           uint32_t available,
++                                           VMAppleGfxProbeHeader *out)
++{
++    VMAppleGfxProbeHeader h;
++
++    if (!bytes || !out || size < 12) {
++        return false;
++    }
++    h.opcode = (uint16_t)bytes[0] | (uint16_t)bytes[1] << 8;
++    h.metadata_count = (uint16_t)bytes[2] | (uint16_t)bytes[3] << 8;
++    h.length = vmapple_gfx_probe_le32(bytes + 4);
++    h.tag = vmapple_gfx_probe_le32(bytes + 8);
++    if (h.length < 12 || (h.length & 3) || h.length > available ||
++        (uint32_t)h.metadata_count * 8 > h.length - 12) {
++        return false;
++    }
++    *out = h;
++    return true;
++}
++
++/* Payload begins after the variable metadata array. No guest pointer decoding. */
++static inline bool vmapple_gfx_probe_payload(const VMAppleGfxProbeHeader *h,
++                                            uint32_t offset, uint32_t size,
++                                            uint32_t *position)
++{
++    uint32_t start;
++
++    if (!h || !position || h->length < 12 ||
++        (uint32_t)h->metadata_count * 8 > h->length - 12) {
++        return false;
++    }
++    start = 12 + (uint32_t)h->metadata_count * 8;
++    if (offset > h->length - start || size > h->length - start - offset) {
++        return false;
++    }
++    *position = start + offset;
++    return true;
++}
++
++/* Shared control table: bounded to one 16 KiB allocation. */
++static inline bool vmapple_gfx_probe_channel(uint32_t id, uint32_t *offset)
++{
++    if (!offset || id == 0 || id > (16384 - 1024) / 20) {
++        return false;
++    }
++    *offset = 1024 + (id - 1) * 20;
++    return true;
++}
++
++/* Diagnostic host registry, not a promise that commands can execute. */
++#define VMAPPLE_GFX_PROBE_CHANNELS 8
++
++typedef struct VMAppleGfxProbeChannel {
++    bool registered;
++    bool first_page_valid;
++    uint64_t first_page_address;
++    uint32_t id;
++    uint32_t page;
++    uint16_t ring_units;
++} VMAppleGfxProbeChannel;
++
++static inline bool vmapple_gfx_probe_register(VMAppleGfxProbeChannel *slots,
++                                              uint32_t id,
++                                              const uint8_t *control,
++                                              size_t size)
++{
++    uint32_t page, packed;
++    VMAppleGfxProbeChannel *slot;
++
++    if (!slots || !control || size != 20 || id == 0 ||
++        id > VMAPPLE_GFX_PROBE_CHANNELS) {
++        return false;
++    }
++    page = vmapple_gfx_probe_le32(control + 16);
++    packed = vmapple_gfx_probe_le32(control + 12);
++    /* Only the fresh, idle registration contract is implemented. */
++    if (!page || vmapple_gfx_probe_le32(control) != 0 ||
++        vmapple_gfx_probe_le32(control + 4) != 0 ||
++        vmapple_gfx_probe_le32(control + 8) != UINT32_MAX ||
++        (packed & 0xffff) != id) {
++        return false;
++    }
++    slot = &slots[id - 1];
++    if (slot->registered) {
++        return slot->id == id && slot->page == page &&
++               slot->ring_units == (packed >> 16);
++    }
++    slot->id = id;
++    slot->page = page;
++    slot->ring_units = packed >> 16;
++    slot->registered = true;
++    return true;
++}
++
++static inline bool vmapple_gfx_probe_page_address(uint32_t page,
++                                                 uint64_t *address)
++{
++    if (!page || !address) {
++        return false;
++    }
++    *address = (uint64_t)page << 14;
++    return true;
++}
++
++typedef struct VMAppleGfxProbeQuery {
++    uint64_t response_size;
++    uint64_t destination_page;
++} VMAppleGfxProbeQuery;
++
++/* Decode the fixed device-info query variant only; caller validates RAM. */
++static inline bool vmapple_gfx_probe_query(const VMAppleGfxProbeHeader *h,
++                                          const uint8_t *payload, size_t size,
++                                          VMAppleGfxProbeQuery *out)
++{
++    VMAppleGfxProbeQuery q;
++    uint32_t position;
++
++    if (!h || !payload || !out || size != 12 || h->opcode != 58 ||
++        h->metadata_count || h->length != 24 ||
++        !vmapple_gfx_probe_payload(h, 0, 12, &position) ||
++        vmapple_gfx_probe_le32(payload) != 18) {
++        return false;
++    }
++    q.response_size = (uint64_t)vmapple_gfx_probe_le32(payload + 4) << 3;
++    if (q.response_size != 16384 ||
++        !vmapple_gfx_probe_page_address(
++            vmapple_gfx_probe_le32(payload + 8), &q.destination_page)) {
++        return false;
++    }
++    *out = q;
++    return true;
++}
++
++/* A completion value carries its stamp index in the low byte. The remaining
++ * bits are a sequence, not a byte address. Count comes from negotiated state.
++ */
++static inline bool vmapple_gfx_probe_stamp(uint64_t base, uint32_t count,
++                                          uint32_t value, uint64_t *address)
++{
++    uint32_t index = value & 255;
++    uint64_t offset = (uint64_t)index * 4;
++
++    if (!address || !base || (base & 3) || !count || count > 256 ||
++        index >= count || base > UINT64_MAX - offset - 4) {
++        return false;
++    }
++    *address = base + offset;
++    return true;
++}
++
++/* The guest bounds parsing by allocation_size / 8, not a returned count.
++ * Key 18 terminates this version's 0..17 device-info key space. This response
++ * deliberately advertises no capabilities and does not imply GPU support.
++ */
++static inline bool vmapple_gfx_probe_empty_info(uint8_t *buffer, size_t size)
++{
++    size_t offset;
++
++    if (!buffer || size != 16384) {
++        return false;
++    }
++    for (offset = 0; offset < size; offset += 8) {
++        buffer[offset] = 18;
++        buffer[offset + 1] = 0;
++        buffer[offset + 2] = 0;
++        buffer[offset + 3] = 0;
++        buffer[offset + 4] = 0;
++        buffer[offset + 5] = 0;
++        buffer[offset + 6] = 0;
++        buffer[offset + 7] = 0;
++    }
++    return true;
++}
++
++/* Channel stamps occupy one 32-bit slot each in the reserved FIFO page. */
++static inline bool vmapple_gfx_probe_channel_stamp(uint64_t fifo, uint32_t channel,
++                                                 uint64_t *address)
++{
++    if (!address || !fifo || (fifo & 16383) || channel >= 8 ||
++        fifo > UINT64_MAX - channel * 4 - 4) {
++        return false;
++    }
++    *address = fifo + channel * 4;
++    return true;
++}
++
++/* Root channel index is fixed at zero. Its stamp storage is the FIFO's
++ * reserved first 16 KiB page, not the shared control-table allocation.
++ * Reject tags belonging to another channel instead of inferring a new slot.
++ */
++static inline bool vmapple_gfx_probe_root_stamp(uint32_t fifo_page,
++                                               uint32_t sequence,
++                                               uint64_t *address)
++{
++    uint64_t base;
++
++    if ((sequence & 255) ||
++        !vmapple_gfx_probe_page_address(fifo_page, &base)) {
++        return false;
++    }
++    return vmapple_gfx_probe_stamp(base, 1, sequence, address);
++}
++
++typedef struct VMAppleGfxProbeAddressSpace {
++    uint32_t id;
++    bool flag;
++    uint64_t extent;
++    uint64_t root_address;
++} VMAppleGfxProbeAddressSpace;
++
++/* Kernel registration sets flag; mapper-backed addresses must not be treated
++ * as ordinary table translations or identity-mapped physical RAM.
++ */
++static inline bool vmapple_gfx_probe_uses_table(
++    const VMAppleGfxProbeAddressSpace *space)
++{
++    return space && !space->flag;
++}
++
++/* Descriptor only: validating a root does not implement page-table walking. */
++static inline bool vmapple_gfx_probe_address_space(
++    const VMAppleGfxProbeHeader *h, const uint8_t *payload, size_t size,
++    VMAppleGfxProbeAddressSpace *out)
++{
++    VMAppleGfxProbeAddressSpace space;
++    uint32_t packed;
++
++    if (!h || !payload || !out || h->opcode != 56 || h->metadata_count ||
++        h->length != 28 || size != 16) {
++        return false;
++    }
++    packed = vmapple_gfx_probe_le32(payload);
++    space.id = packed >> 1;
++    space.flag = packed & 1;
++    space.extent = vmapple_gfx_probe_le32(payload + 4) |
++                   (uint64_t)vmapple_gfx_probe_le32(payload + 8) << 32;
++    if (space.id >= 8 || !space.extent ||
++        !vmapple_gfx_probe_page_address(
++            vmapple_gfx_probe_le32(payload + 12), &space.root_address)) {
++        return false;
++    }
++    *out = space;
++    return true;
++}
++
++typedef struct VMAppleGfxProbeHeap {
++    bool registered;
++    uint32_t address_space_id;
++    uint64_t gpu_address;
++    uint32_t size;
++} VMAppleGfxProbeHeap;
++
++/* The address is GPU virtual, not a physical RAM page. Translation is separate. */
++static inline bool vmapple_gfx_probe_heap(
++    const VMAppleGfxProbeHeader *h, const uint8_t *payload, size_t size,
++    VMAppleGfxProbeHeap *out)
++{
++    VMAppleGfxProbeHeap heap = {0};
++    uint32_t page;
++
++    if (!h || !payload || !out || h->opcode != 51 || h->metadata_count ||
++        h->length != 24 || size != 12) {
++        return false;
++    }
++    heap.address_space_id = vmapple_gfx_probe_le32(payload);
++    page = vmapple_gfx_probe_le32(payload + 4);
++    heap.size = vmapple_gfx_probe_le32(payload + 8);
++    if (heap.address_space_id >= 8 || !page || !heap.size ||
++        heap.size > 16 * 1024 * 1024) {
++        return false;
++    }
++    heap.gpu_address = (uint64_t)page << 14;
++    *out = heap;
++    return true;
++}
++
++static inline bool vmapple_gfx_probe_heap_register(
++    VMAppleGfxProbeHeap *slots, const bool *address_spaces,
++    const VMAppleGfxProbeHeap *heap)
++{
++    VMAppleGfxProbeHeap *old;
++
++    if (!slots || !address_spaces || !heap || heap->address_space_id >= 8 ||
++        !address_spaces[heap->address_space_id] || !heap->gpu_address ||
++        (heap->gpu_address & 16383) || !heap->size ||
++        heap->size > 16 * 1024 * 1024) {
++        return false;
++    }
++    old = &slots[heap->address_space_id];
++    if (old->registered) {
++        return old->gpu_address == heap->gpu_address && old->size == heap->size;
++    }
++    *old = *heap;
++    old->registered = true;
++    return true;
++}
++
++/* Two 4096-entry levels, 32-bit page entries and 16 KiB pages. The callback
++ * must reject non-RAM reads; the walker never writes or caches translations.
++ */
++typedef bool (*VMAppleGfxProbeReadEntry)(void *opaque, uint64_t address,
++                                        uint32_t *entry);
++
++typedef struct VMAppleGfxProbeWalkResult {
++    unsigned stage; /* 1=input, 2=interior read, 3=interior absent/invalid,
++                     * 4=leaf read, 5=leaf absent. Zero means translated. */
++    uint32_t entry;
++} VMAppleGfxProbeWalkResult;
++
++static inline bool vmapple_gfx_probe_translate_detail(
++    uint64_t root, uint64_t gpu_address, VMAppleGfxProbeReadEntry read_entry,
++    void *opaque, uint64_t *physical, VMAppleGfxProbeWalkResult *detail)
++{
++    uint32_t interior, leaf;
++    uint64_t table, result;
++
++    if (!detail) {
++        return false;
++    }
++    *detail = (VMAppleGfxProbeWalkResult){.stage = 1};
++    if (!root || (root & 16383) || root > UINT64_MAX - 16384 ||
++        gpu_address >= (UINT64_C(1) << 38) || !read_entry || !physical) {
++        return false;
++    }
++    detail->stage = 2;
++    if (!read_entry(opaque, root + ((gpu_address >> 26) & 4095) * 4, &interior)) {
++        return false;
++    }
++    detail->stage = 3;
++    detail->entry = interior;
++    table = (uint64_t)interior << 14;
++    if (!interior || (interior & 0x80000000) || table == root) {
++        return false;
++    }
++    detail->stage = 4;
++    detail->entry = 0;
++    if (!read_entry(opaque, table + ((gpu_address >> 14) & 4095) * 4, &leaf)) {
++        return false;
++    }
++    detail->stage = 5;
++    detail->entry = leaf;
++    if (!(leaf & 0x7fffffff)) {
++        return false;
++    }
++    /* Bit31 is a leaf attribute, not part of the physical page number. */
++    result = ((uint64_t)(leaf & 0x7fffffff) << 14) | (gpu_address & 16383);
++    *physical = result;
++    detail->stage = 0;
++    return true;
++}
++
++static inline bool vmapple_gfx_probe_translate(
++    uint64_t root, uint64_t gpu_address, VMAppleGfxProbeReadEntry read_entry,
++    void *opaque, uint64_t *physical)
++{
++    VMAppleGfxProbeWalkResult detail;
++
++    return vmapple_gfx_probe_translate_detail(root, gpu_address, read_entry,
++                                             opaque, physical, &detail);
++}
++/* Address-space root names a descriptor, not a raw table. */
++static inline bool vmapple_gfx_probe_table_descriptor(
++    const uint8_t *bytes, size_t size, uint64_t *table)
++{
++    uint64_t address;
++    if (!bytes || !table || size != 28 ||
++        vmapple_gfx_probe_le32(bytes + 4) != 2 ||
++        !vmapple_gfx_probe_page_address(vmapple_gfx_probe_le32(bytes), &address)) {
++        return false;
++    }
++    *table = address;
++    return true;
++}
++/* IOSurface counters count 16-byte records. Limit is observer budget. */
++static inline bool vmapple_gfx_probe_iosfc_slot(
++    uint64_t base, uint64_t capacity, uint64_t consumer, uint64_t producer,
++    uint64_t *address)
++{
++    if (!address || !base || (base & 16383) || !capacity || capacity > 1024 ||
++        producer <= consumer || producer - consumer > capacity ||
++        base > UINT64_MAX - capacity * 16) {
++        return false;
++    }
++    *address = base + (consumer % capacity) * 16;
++    return true;
++}
++typedef struct VMAppleGfxProbeSurface {
++    uint32_t pixel_format, base_offset, allocation_size;
++    uint32_t width, height, bytes_per_row;
++    uint16_t bytes_per_element;
++} VMAppleGfxProbeSurface;
++
++/* Deliberately only accept packed linear surfaces. This is metadata validation,
++ * not permission to access any backing memory or proof of a renderable format.
++ */
++static inline bool vmapple_gfx_probe_surface(const uint8_t *bytes, size_t size,
++                                            VMAppleGfxProbeSurface *surface)
++{
++    VMAppleGfxProbeSurface result;
++    uint64_t row, end;
++
++    if (!bytes || !surface || size != 512 || bytes[36] != 0) {
++        return false;
++    }
++    result.pixel_format = vmapple_gfx_probe_le32(bytes + 4);
++    result.base_offset = vmapple_gfx_probe_le32(bytes + 8);
++    result.allocation_size = vmapple_gfx_probe_le32(bytes + 16);
++    result.width = vmapple_gfx_probe_le32(bytes + 20) >> 8;
++    result.height = vmapple_gfx_probe_le32(bytes + 24) >> 8;
++    result.bytes_per_row = vmapple_gfx_probe_le32(bytes + 28);
++    result.bytes_per_element = bytes[32] | (uint16_t)bytes[33] << 8;
++    row = (uint64_t)result.width * result.bytes_per_element;
++    end = (uint64_t)result.base_offset +
++          (uint64_t)result.bytes_per_row * result.height;
++    if (!result.width || !result.height || !result.bytes_per_element ||
++        row > result.bytes_per_row || end > result.allocation_size) {
++        return false;
++    }
++    *surface = result;
++    return true;
++}
++/* Backing entries encode page number in bits31:2.
++ * Root tag1 names a list; tag3 selects a directory of lists. Data
++ * entries within a list have tag1. Support only one-list allocations.
++ */
++static inline bool vmapple_gfx_probe_backing(
++    uint32_t root, uint64_t allocation_size, uint64_t byte_offset,
++    VMAppleGfxProbeReadEntry read_entry, void *opaque, uint64_t *physical)
++{
++    uint64_t list = (uint64_t)(root >> 2) << 14;
++    uint32_t entry;
++
++    if (!physical || !read_entry || !list || (root & 3) != 1 ||
++        !allocation_size || allocation_size > UINT64_C(16384) * 4096 ||
++        byte_offset >= allocation_size ||
++        !read_entry(opaque, list + (byte_offset >> 14) * 4, &entry) ||
++        (entry & 3) != 1 || !(entry >> 2)) {
++        return false;
++    }
++    *physical = ((uint64_t)(entry >> 2) << 14) + (byte_offset & 16383);
++    return true;
++}
++typedef struct VMAppleGfxProbeRootPrefix {
++    unsigned count;
++    uint32_t bytes;
++    bool failed;
++} VMAppleGfxProbeRootPrefix;
++
++/* Only these seven ordered, actually handled registration/query commands may
++ * form the initial completion candidate. This never publishes completion.
++ */
++static inline bool vmapple_gfx_probe_root_prefix(
++    VMAppleGfxProbeRootPrefix *prefix, const VMAppleGfxProbeHeader *header,
++    bool handled)
++{
++    static const uint16_t opcodes[7] = {56, 51, 48, 48, 48, 48, 58};
++    static const uint32_t lengths[7] = {28, 24, 16, 16, 16, 16, 24};
++    unsigned n;
++
++    if (!prefix || !header || prefix->failed || prefix->count >= 7) {
++        return false;
++    }
++    n = prefix->count;
++    if (!handled || header->metadata_count || header->opcode != opcodes[n] ||
++        header->length != lengths[n] || header->tag != (n + 1) * 256) {
++        prefix->failed = true;
++        return false;
++    }
++    prefix->bytes += header->length;
++    prefix->count++;
++    return prefix->count == 7 && prefix->bytes == 140;
++}
++#endif
+diff --git a/include/system/system.h b/include/system/system.h
+index 03a2d0e9..a8007ca7 100644
+--- a/include/system/system.h
++++ b/include/system/system.h
+@@ -15,6 +15,11 @@ extern bool qemu_uuid_set;
+ 
+ const char *qemu_get_vm_name(void);
+ 
++/* Normal cleanup, after vCPU shutdown and before TLS/console teardown; BQL held.
++ * Not called by exit() on initialization failure: OS reclaims resources there.
++ */
++void qemu_add_cleanup_notifier(Notifier *notify);
++
+ /* Exit notifiers will run with BQL held. */
+ void qemu_add_exit_notifier(Notifier *notify);
+ void qemu_remove_exit_notifier(Notifier *notify);
+diff --git a/qapi/ui.json b/qapi/ui.json
+index b2c42a7f..97b03d2a 100644
+--- a/qapi/ui.json
++++ b/qapi/ui.json
+@@ -180,6 +180,9 @@
+ #     parameter is missing, the primary display will be used.
+ #     (Since 2.12)
+ #
++#     This local build also accepts an absolute QOM graphic console
++#     path, without @head, for machine-owned displays.
++#
+ # @head: head to use in case the device supports multiple heads.  If
+ #     this parameter is missing, head #0 will be used.  Also note that
+ #     the head can only be specified in conjunction with the device
+diff --git a/system/runstate.c b/system/runstate.c
+index 08acf801..0dc5995c 100644
+--- a/system/runstate.c
++++ b/system/runstate.c
+@@ -65,6 +65,9 @@
+ 
+ #include "trace.h"
+ 
++static NotifierList cleanup_notifiers =
++    NOTIFIER_LIST_INITIALIZER(cleanup_notifiers);
++
+ static NotifierList exit_notifiers =
+     NOTIFIER_LIST_INITIALIZER(exit_notifiers);
+ 
+@@ -953,6 +956,11 @@ int qemu_main_loop(void)
+     return status;
+ }
+ 
++void qemu_add_cleanup_notifier(Notifier *notify)
++{
++    notifier_list_add(&cleanup_notifiers, notify);
++}
++
+ void qemu_add_exit_notifier(Notifier *notify)
+ {
+     notifier_list_add(&exit_notifiers, notify);
+@@ -1024,6 +1032,7 @@ void qemu_cleanup(int status)
+ 
+     /* No more vcpu or device emulation activity beyond this point */
+     vm_shutdown();
++    notifier_list_notify(&cleanup_notifiers, NULL);
+     replay_finish();
+ 
+     /*
+diff --git a/ui/ui-qmp-cmds.c b/ui/ui-qmp-cmds.c
+index 753cc2bf..e3bff993 100644
+--- a/ui/ui-qmp-cmds.c
++++ b/ui/ui-qmp-cmds.c
+@@ -330,7 +330,20 @@ qmp_screendump(const char *filename, const char *device,
+     DisplaySurface *surface;
+     int fd;
+ 
+-    if (device) {
++    if (device && device[0] == '/') {
++        Object *obj;
++
++        if (has_head) {
++            error_setg(errp, "console path cannot be combined with head");
++            return;
++        }
++        obj = object_resolve_path_type(device, TYPE_QEMU_GRAPHIC_CONSOLE, NULL);
++        if (!obj) {
++            error_setg(errp, "graphic console path not found: %s", device);
++            return;
++        }
++        con = QEMU_CONSOLE(obj);
++    } else if (device) {
+         con = qemu_console_lookup_by_device_name(device, has_head ? head : 0,
+                                                  errp);
+         if (!con) {
+diff --git a/ui/vnc.c b/ui/vnc.c
+index 656768f9..ee8c696d 100644
+--- a/ui/vnc.c
++++ b/ui/vnc.c
+@@ -58,7 +58,7 @@
+ #include "io/dns-resolver.h"
+ #include "monitor/monitor.h"
+ 
+-#define VNC_REFRESH_INTERVAL_BASE GUI_REFRESH_INTERVAL_DEFAULT
++#define VNC_REFRESH_INTERVAL_BASE 16
+ #define VNC_REFRESH_INTERVAL_INC  50
+ #define VNC_REFRESH_INTERVAL_MAX  GUI_REFRESH_INTERVAL_IDLE
+ static const struct timeval VNC_REFRESH_STATS = { 0, 500000 };
+@@ -657,6 +657,10 @@ static void vnc_dpy_update(DisplayChangeListener *dcl,
+     struct VncSurface *s = &vd->guest;
+ 
+     vnc_set_area_dirty(s->dirty, vd, x, y, w, h);
++    if (!QTAILQ_EMPTY(&vd->clients) &&
++        vd->dcl.update_interval > VNC_REFRESH_INTERVAL_BASE) {
++        qemu_console_listener_set_refresh(&vd->dcl, VNC_REFRESH_INTERVAL_BASE);
++    }
+ }
+ 
+ void vnc_framebuffer_update(VncState *vs, int x, int y, int w, int h,

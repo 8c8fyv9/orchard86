@@ -1,0 +1,30 @@
+From cce9d73aea62f7bd50baf139c69fee8824b01d82 Mon Sep 17 00:00:00 2001
+From: cheems <cheems>
+Date: Tue, 24 Nov 2026 22:59:23 +0800
+Subject: [PATCH] perf(arm/tcg): fast-path 64B __builtin_memset in
+ helper_dc_zva
+
+---
+ target/arm/tcg/helper-a64.c | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/target/arm/tcg/helper-a64.c b/target/arm/tcg/helper-a64.c
+index 187d5a91..6411b91a 100644
+--- a/target/arm/tcg/helper-a64.c
++++ b/target/arm/tcg/helper-a64.c
+@@ -890,7 +890,11 @@ void HELPER(dc_zva)(CPUARMState *env, uint64_t vaddr_in)
+ #endif
+ 
+     set_helper_retaddr(ra);
+-    memset(mem, 0, blocklen);
++    if (likely(blocklen == 64)) {
++        __builtin_memset(mem, 0, 64);
++    } else {
++        memset(mem, 0, blocklen);
++    }
+     clear_helper_retaddr();
+ }
+ 
+-- 
+2.47.3
+

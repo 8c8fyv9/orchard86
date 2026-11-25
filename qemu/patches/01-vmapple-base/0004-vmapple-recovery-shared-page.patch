@@ -1,0 +1,58 @@
+diff --git a/hw/vmapple/vmapple.c b/hw/vmapple/vmapple.c
+index e0e9f0b..4b18108 100644
+--- a/hw/vmapple/vmapple.c
++++ b/hw/vmapple/vmapple.c
+@@ -70,6 +70,8 @@ struct VMAppleMachineState {
+     Notifier powerdown_notifier;
+     PCIBus *bus;
+     MemoryRegion fw_mr;
++    MemoryRegion recovery_shared_mr;
++    bool recovery_shared_page;
+     MemoryRegion ecam_alias;
+ #ifndef CONFIG_MAC_PVG_MMIO
+     MemoryRegion gfx_stub_mr;
+@@ -626,6 +628,14 @@ static void mach_vmapple_init(MachineState *machine)
+     memory_region_add_subregion(sysmem, vms->memmap[VMAPPLE_MEM].base,
+                                 machine->ram);
+ 
++    if (vms->recovery_shared_page) {
++        /* Storage only: guest owns all contents and protocol state. */
++        memory_region_init_ram(&vms->recovery_shared_mr, NULL,
++                               "vmapple-recovery-shared", 0x4000, &error_fatal);
++        memory_region_add_subregion(sysmem, 0x4fc000,
++                                    &vms->recovery_shared_mr);
++    }
++
+     create_gic(vms, sysmem);
+     create_bdif(vms, sysmem);
+     create_pvpanic(vms, sysmem);
+@@ -739,6 +749,16 @@ static void vmapple_machine_class_init(ObjectClass *oc, const void *data)
+                      G_N_ELEMENTS(vmapple_compat_defaults));
+ }
+ 
++static bool vmapple_get_recovery_shared_page(Object *obj, Error **errp)
++{
++    return VMAPPLE_MACHINE(obj)->recovery_shared_page;
++}
++
++static void vmapple_set_recovery_shared_page(Object *obj, bool value, Error **errp)
++{
++    VMAPPLE_MACHINE(obj)->recovery_shared_page = value;
++}
++
+ static bool vmapple_get_run_installer(Object *obj, Error **errp)
+ {
+     return VMAPPLE_MACHINE(obj)->run_installer;
+@@ -759,6 +779,12 @@ static void vmapple_instance_init(Object *obj)
+                                    OBJ_PROP_FLAG_READWRITE);
+     object_property_set_description(obj, "uuid", "Machine UUID (SDOM)");
+ 
++    object_property_add_bool(obj, "recovery-shared-page",
++                             vmapple_get_recovery_shared_page,
++                             vmapple_set_recovery_shared_page);
++    object_property_set_description(obj, "recovery-shared-page",
++        "Back the recovery communication page with RAM (default off)");
++
+     object_property_add_bool(obj, "run-installer",
+                              vmapple_get_run_installer,
+                              vmapple_set_run_installer);

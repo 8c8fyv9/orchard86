@@ -1,0 +1,21 @@
+diff --git a/hw/virtio/virtio-qmp.c b/hw/virtio/virtio-qmp.c
+index 57cc038..e4ef2e5 100644
+--- a/hw/virtio/virtio-qmp.c
++++ b/hw/virtio/virtio-qmp.c
+@@ -643,6 +643,7 @@ VirtioDeviceFeatures *qmp_decode_features(uint16_t device_id,
+     case VIRTIO_ID_DMABUF:
+     case VIRTIO_ID_PARAM_SERV:
+     case VIRTIO_ID_AUDIO_POLICY:
++    case 0x1a01: /* VMApple USB: report unrecognized device bits as raw. */
+         break;
+     default:
+         g_assert_not_reached();
+@@ -713,6 +714,8 @@ VirtioStatus *qmp_x_query_virtio_status(const char *path, Error **errp)
+                                                  vdev->guest_features_ex);
+     status->host_features = qmp_decode_features(vdev->device_id,
+                                                 vdev->host_features_ex);
++    status->backend_features = qmp_decode_features(vdev->device_id,
++                                                   vdev->backend_features_ex);
+ 
+     switch (vdev->device_endian) {
+     case VIRTIO_DEVICE_ENDIAN_LITTLE:

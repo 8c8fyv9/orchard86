@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.pyo
+*.log
+*.img
+*.qcow2
+*.raw
+*.ipsw
+*.bin
+build/
+out/
+runtime/
+plan/
+target/
+cargo-home/
+.DS_Store

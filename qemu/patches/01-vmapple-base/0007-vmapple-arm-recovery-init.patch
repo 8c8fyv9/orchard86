@@ -1,0 +1,179 @@
+diff --git a/hw/vmapple/vmapple.c b/hw/vmapple/vmapple.c
+index e1afc9e..616df42 100644
+--- a/hw/vmapple/vmapple.c
++++ b/hw/vmapple/vmapple.c
+@@ -645,6 +645,11 @@ static void mach_vmapple_init(MachineState *machine)
+     unsigned int smp_cpus = machine->smp.cpus;
+     unsigned int max_cpus = machine->smp.max_cpus;
+ 
++    ARMPACKey pac_defaults[5];
++    uint64_t pac_ids[2];
++
++    qemu_guest_getrandom_nofail(pac_defaults, sizeof(pac_defaults));
++    qemu_guest_getrandom_nofail(pac_ids, sizeof(pac_ids));
+     vms->memmap = memmap;
+     machine->usb = true;
+ 
+@@ -674,7 +679,11 @@ static void mach_vmapple_init(MachineState *machine)
+             isar1 = FIELD_DP64(isar1, ID_AA64ISAR1, APA, 1);
+             isar1 = FIELD_DP64(isar1, ID_AA64ISAR1, API, 1);
+             SET_IDREG(&arm_cpu->isar, ID_AA64ISAR1, isar1);
+-            arm_cpu->pauth_impdef_compat = true;
++            memcpy(arm_cpu->experimental_pac_defaults, pac_defaults,
++                   sizeof(pac_defaults));
++            memcpy(arm_cpu->experimental_pac_default_ids, pac_ids, sizeof(pac_ids));
++            arm_cpu->experimental_pac_defaults_valid = true;
++            arm_cpu->pauth_impdef_compat = !arm_cpu->experimental_pac_init;
+             object_property_set_int(cpu, "cntfrq", VMAPPLE_TIMEBASE_HZ,
+                                     &error_fatal);
+         }
+diff --git a/target/arm/cpu.c b/target/arm/cpu.c
+index 787e4dc..741751c 100644
+--- a/target/arm/cpu.c
++++ b/target/arm/cpu.c
+@@ -2486,6 +2486,7 @@ static ObjectClass *arm_cpu_class_by_name(const char *cpu_model)
+ }
+ 
+ static const Property arm_cpu_properties[] = {
++    DEFINE_PROP_BOOL("experimental-pac-init", ARMCPU, experimental_pac_init, false),
+     DEFINE_PROP_UINT64("midr", ARMCPU, midr, 0),
+     DEFINE_PROP_UINT64("mp-affinity", ARMCPU,
+                         mp_affinity, ARM64_AFFINITY_INVALID),
+diff --git a/target/arm/cpu.h b/target/arm/cpu.h
+index 69633ba..9a41d97 100644
+--- a/target/arm/cpu.h
++++ b/target/arm/cpu.h
+@@ -720,6 +720,10 @@ typedef struct CPUArchState {
+         ARMPACKey apdb;
+         ARMPACKey apga;
+     } keys;
++    uint64_t experimental_pac_el0_diversifier;
++    uint64_t experimental_pac_el1_diversifier;
++    bool experimental_pac_el1_diversify;
++    bool experimental_pac_initialized;
+ 
+     uint64_t scxtnum_el[4];
+ 
+@@ -1030,6 +1034,10 @@ struct ArchCPU {
+      * 0 - disabled, 1 - smc, 2 - hvc
+      */
+     uint32_t psci_conduit;
++    bool experimental_pac_init;
++    ARMPACKey experimental_pac_defaults[5];
++    uint64_t experimental_pac_default_ids[2];
++    bool experimental_pac_defaults_valid;
+ 
+     /* For v8M, initial value of the Secure VTOR */
+     uint32_t init_svtor;
+diff --git a/target/arm/tcg/pauth_helper.c b/target/arm/tcg/pauth_helper.c
+index a7b24ae..60d0981 100644
+--- a/target/arm/tcg/pauth_helper.c
++++ b/target/arm/tcg/pauth_helper.c
+@@ -327,6 +327,26 @@ static uint64_t pauth_computepac(CPUARMState *env, uint64_t data,
+         return pauth_computepac_impdef(data, modifier, (ARMPACKey) { 0 });
+     }
+ 
++    if (cpu->experimental_pac_init && env->experimental_pac_initialized) {
++        unsigned el = arm_current_el(env);
++        uint64_t id = el == 0 ? env->experimental_pac_el0_diversifier :
++                              env->experimental_pac_el1_diversifier;
++        bool enabled = el == 0 || (el == 1 &&
++                                   env->experimental_pac_el1_diversify);
++        if (enabled && id != cpu->experimental_pac_default_ids[1]) {
++            uint8_t input[9], digest[32];
++            gsize length = sizeof(digest);
++            GHmac *hmac = g_hmac_new(G_CHECKSUM_SHA256,
++                                     (const guchar *)&key, sizeof(key));
++            input[0] = 0xe0;
++            stq_le_p(input + 1, id);
++            g_hmac_update(hmac, input, sizeof(input));
++            g_hmac_get_digest(hmac, digest, &length);
++            g_hmac_unref(hmac);
++            key.lo = ldq_le_p(digest);
++            key.hi = ldq_le_p(digest + 8);
++        }
++    }
+     if (cpu_isar_feature(aa64_pauth_qarma5, cpu)) {
+         return pauth_computepac_architected(data, modifier, key, false);
+     } else if (cpu_isar_feature(aa64_pauth_qarma3, cpu)) {
+diff --git a/target/arm/tcg/psci.c b/target/arm/tcg/psci.c
+index 56754bd..7906fae 100644
+--- a/target/arm/tcg/psci.c
++++ b/target/arm/tcg/psci.c
+@@ -88,6 +88,76 @@ void arm_handle_psci_call(ARMCPU *cpu)
+         goto err;
+     }
+ 
++    /* Local PAC compatibility services; unknown functions remain unsupported. */
++    if (cpu->experimental_pac_init && is_a64(env) &&
++        cpu->experimental_pac_defaults_valid &&
++        (param[0] == 0xc1000004 || param[0] == 0xc1000005)) {
++        if (param[0] == 0xc1000004) {
++            env->experimental_pac_el0_diversifier = param[1];
++        } else {
++            if (param[1] > 1) {
++                env->xregs[0] = QEMU_PSCI_RET_INVALID_PARAMS;
++                return;
++            }
++            env->experimental_pac_el1_diversify = param[1];
++            env->experimental_pac_el1_diversifier = param[2];
++        }
++        env->xregs[0] = 0;
++        return;
++    }
++    if (cpu->experimental_pac_init && is_a64(env) &&
++        cpu->experimental_pac_defaults_valid && param[0] == 0xc1000003) {
++        ARMPACKey keys[2];
++        const unsigned indices[2] = { 1, 3 };
++        unsigned k;
++
++        for (k = 0; k < 2; k++) {
++            const ARMPACKey *base = &cpu->experimental_pac_defaults[indices[k]];
++            if (param[1] == cpu->experimental_pac_default_ids[0]) {
++                keys[k] = *base;
++            } else {
++                uint8_t input[9], digest[32];
++                gsize length = sizeof(digest);
++                GHmac *hmac = g_hmac_new(G_CHECKSUM_SHA256,
++                                         (const guchar *)base, sizeof(*base));
++                input[0] = indices[k];
++                stq_le_p(input + 1, param[1]);
++                g_hmac_update(hmac, input, sizeof(input));
++                g_hmac_get_digest(hmac, digest, &length);
++                g_hmac_unref(hmac);
++                keys[k].lo = ldq_le_p(digest);
++                keys[k].hi = ldq_le_p(digest + 8);
++            }
++        }
++        env->keys.apib = keys[0];
++        env->keys.apdb = keys[1];
++        env->xregs[0] = 0;
++        return;
++    }
++    if (cpu->experimental_pac_init && is_a64(env) &&
++        cpu->experimental_pac_defaults_valid && param[0] == 0xc1000001) {
++        /* Opaque process identifiers, not raw PAC key halves. */
++        env->xregs[2] = cpu->experimental_pac_default_ids[0];
++        env->xregs[3] = cpu->experimental_pac_default_ids[1];
++        env->xregs[0] = 0;
++        return;
++    }
++    if (cpu->experimental_pac_init && is_a64(env) &&
++        param[0] == 0xc1000000) {
++        if (!cpu->experimental_pac_defaults_valid) {
++            env->xregs[0] = QEMU_PSCI_RET_NOT_SUPPORTED;
++            return;
++        }
++        QEMU_BUILD_BUG_ON(sizeof(env->keys) !=
++                          sizeof(cpu->experimental_pac_defaults));
++        memcpy(&env->keys, cpu->experimental_pac_defaults, sizeof(env->keys));
++        env->experimental_pac_el0_diversifier = cpu->experimental_pac_default_ids[1];
++        env->experimental_pac_el1_diversify = false;
++        env->experimental_pac_initialized = true;
++        env->xregs[0] = 0;
++        return;
++    }
++
+     switch (param[0]) {
+         CPUState *target_cpu_state;
+         ARMCPU *target_cpu;

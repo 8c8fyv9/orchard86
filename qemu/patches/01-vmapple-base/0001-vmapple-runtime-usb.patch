@@ -1,0 +1,341 @@
+diff --git a/hw/vmapple/virtio-usb.c b/hw/vmapple/virtio-usb.c
+new file mode 100644
+index 00000000..c2f11565
+--- /dev/null
++++ b/hw/vmapple/virtio-usb.c
+@@ -0,0 +1,313 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++/* Experimental VMApple USB transport. No host connection is synthesized. */
++#include "qemu/osdep.h"
++#include "hw/virtio/virtio.h"
++#include "hw/virtio/virtio-pci.h"
++#include "hw/core/qdev-properties.h"
++#include "qapi/error.h"
++#include "qemu/module.h"
++#include "qemu/error-report.h"
++#include "migration/blocker.h"
++#include "qemu/timer.h"
++#include "qemu/iov.h"
++#include "qemu/sockets.h"
++
++#define TYPE_VMAPPLE_USB "vmapple-virtio-usb-device"
++#define TYPE_VMAPPLE_USB_PCI "vmapple-virtio-usb-pci"
++OBJECT_DECLARE_SIMPLE_TYPE(VMAppleUSB, VMAPPLE_USB)
++OBJECT_DECLARE_SIMPLE_TYPE(VMAppleUSBPCI, VMAPPLE_USB_PCI)
++
++struct VMAppleUSB {
++    VirtIODevice parent_obj;
++    VirtQueue *request_queue;
++    VirtQueue *response_queue;
++    bool request_notified;
++    bool response_notified;
++    Error *migration_blocker;
++    QEMUTimer *diagnostic_timer;
++    uint64_t queue_snapshot;
++    unsigned diagnostic_samples;
++    int32_t host_fd;
++    uint32_t host_poll_us;
++    QEMUTimer *host_timer;
++    uint8_t pending[131072];
++    size_t pending_len;
++};
++
++struct VMAppleUSBPCI {
++    VirtIOPCIProxy parent_obj;
++    VMAppleUSB vdev;
++};
++
++static void usb_host_tick(void *opaque)
++{
++    VMAppleUSB *s = opaque;
++    VirtIODevice *vdev = VIRTIO_DEVICE(s);
++    VirtQueueElement *elem;
++    unsigned budget = 16;
++
++    if ((vdev->status & VIRTIO_CONFIG_S_DRIVER_OK) &&
++        virtio_queue_ready(s->request_queue) &&
++        virtio_queue_ready(s->response_queue)) {
++        if (!s->pending_len) {
++            ssize_t n = recv(s->host_fd, s->pending, sizeof(s->pending),
++                             MSG_DONTWAIT | MSG_TRUNC);
++            if (n >= 6 && n <= sizeof(s->pending) &&
++                s->pending[5] >= 1 && s->pending[5] <= 3) {
++                s->pending_len = n;
++            } else if (n == 0) {
++                info_report("vmapple USB: host disconnected");
++                return;
++            } else if (n > 0) {
++                warn_report("vmapple USB: rejected host request length %zd", n);
++            }
++        }
++        if (s->pending_len &&
++            (elem = virtqueue_pop(s->request_queue, sizeof(*elem)))) {
++            if (elem->out_num ||
++                iov_size(elem->in_sg, elem->in_num) < s->pending_len) {
++                virtio_error(vdev, "USB receive descriptor has invalid direction/size");
++                virtqueue_detach_element(s->request_queue, elem, 0);
++            } else {
++                iov_from_buf(elem->in_sg, elem->in_num, 0,
++                             s->pending, s->pending_len);
++                virtqueue_push(s->request_queue, elem, s->pending_len);
++                virtio_notify(vdev, s->request_queue);
++                info_report("vmapple USB: delivered host request type=%u ep=%u bytes=%zu",
++                            s->pending[5], s->pending[4], s->pending_len);
++                s->pending_len = 0;
++            }
++            g_free(elem);
++        }
++        while (budget-- &&
++               (elem = virtqueue_pop(s->response_queue, sizeof(*elem)))) {
++            size_t n = iov_size(elem->out_sg, elem->out_num);
++            uint8_t *buffer;
++            ssize_t sent;
++
++            if (elem->in_num || n < 2 || n > sizeof(s->pending)) {
++                virtio_error(vdev, "USB response descriptor has invalid direction/size");
++                virtqueue_detach_element(s->response_queue, elem, 0);
++                g_free(elem);
++                break;
++            }
++            buffer = g_malloc(n);
++            iov_to_buf(elem->out_sg, elem->out_num, 0, buffer, n);
++            sent = send(s->host_fd, buffer, n, MSG_DONTWAIT | MSG_NOSIGNAL);
++            g_free(buffer);
++            if (sent != n) {
++                virtqueue_unpop(s->response_queue, elem, 0);
++                g_free(elem);
++                break;
++            }
++            virtqueue_push(s->response_queue, elem, 0);
++            virtio_notify(vdev, s->response_queue);
++            info_report("vmapple USB: forwarded guest response bytes=%zu", n);
++            g_free(elem);
++        }
++    }
++    timer_mod(s->host_timer, qemu_clock_get_us(QEMU_CLOCK_VIRTUAL) + s->host_poll_us);
++}
++
++static void usb_request_kick(VirtIODevice *vdev, VirtQueue *vq)
++{
++    VMAppleUSB *s = VMAPPLE_USB(vdev);
++
++    /* Leave receive buffers available until a real host request exists. */
++    if (!s->request_notified) {
++        s->request_notified = true;
++        info_report("vmapple USB: request receive queue notified");
++    }
++}
++
++static void usb_response_kick(VirtIODevice *vdev, VirtQueue *vq)
++{
++    VMAppleUSB *s = VMAPPLE_USB(vdev);
++
++    /* Polling backend owns completion; a kick alone never acknowledges data. */
++    if (!s->response_notified) {
++        s->response_notified = true;
++        info_report("vmapple USB: response queue notified; host backend %s",
++                    s->host_fd >= 0 ? "attached" : "unavailable");
++    }
++}
++
++static uint64_t usb_features(VirtIODevice *vdev, uint64_t features,
++                             Error **errp)
++{
++    return features | (1ULL << VIRTIO_F_VERSION_1);
++}
++
++static void usb_diagnostic_tick(void *opaque)
++{
++    VMAppleUSB *s = opaque;
++    VirtIODevice *vdev = VIRTIO_DEVICE(s);
++    unsigned in[2] = { 0 }, out[2] = { 0 };
++    uint64_t snapshot;
++    int i;
++
++    for (i = 0; i < 2; i++) {
++        VirtQueue *vq = i ? s->response_queue : s->request_queue;
++
++        if (virtio_queue_ready(vq)) {
++            virtqueue_get_avail_bytes(vq, &in[i], &out[i], 131072, 131072);
++        }
++    }
++    snapshot = ((uint64_t)in[0] << 32) | out[1];
++    snapshot ^= (uint64_t)virtio_queue_ready(s->request_queue) << 63;
++    snapshot ^= (uint64_t)virtio_queue_ready(s->response_queue) << 62;
++    if (!s->diagnostic_samples || snapshot != s->queue_snapshot) {
++        info_report("vmapple USB: queues ready=%d/%d num=%d/%d "
++                    "avail in=%u/%u out=%u/%u",
++                    virtio_queue_ready(s->request_queue),
++                    virtio_queue_ready(s->response_queue),
++                    virtio_queue_get_num(vdev, 0), virtio_queue_get_num(vdev, 1),
++                    in[0], in[1], out[0], out[1]);
++        s->queue_snapshot = snapshot;
++    }
++    if (++s->diagnostic_samples < 120 &&
++        (vdev->status & VIRTIO_CONFIG_S_DRIVER_OK)) {
++        timer_mod(s->diagnostic_timer,
++                  qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1000);
++    }
++}
++
++static int usb_status(VirtIODevice *vdev, uint8_t status)
++{
++    VMAppleUSB *s = VMAPPLE_USB(vdev);
++
++    info_report("vmapple USB: guest status 0x%02x", status);
++    if (!status) {
++        timer_del(s->diagnostic_timer);
++        s->diagnostic_samples = 0;
++        s->pending_len = 0;
++        s->request_notified = false;
++        s->response_notified = false;
++    } else if (status & VIRTIO_CONFIG_S_DRIVER_OK) {
++        timer_mod(s->diagnostic_timer,
++                  qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + 1000);
++    }
++    return 0;
++}
++
++static void usb_realize(DeviceState *dev, Error **errp)
++{
++    VMAppleUSB *s = VMAPPLE_USB(dev);
++    VirtIODevice *vdev = VIRTIO_DEVICE(dev);
++
++    if (s->host_fd >= 0 && s->host_poll_us < 100) {
++        error_setg(errp, "host-poll-us must be at least 100");
++        return;
++    }
++    /* Private PCI identification selects the driver, not a standard USB ID. */
++    if (s->host_fd >= 0) {
++        struct sockaddr_storage address;
++        socklen_t address_len = sizeof(address), type_len = sizeof(int);
++        int type;
++
++        if (getsockname(s->host_fd, (struct sockaddr *)&address, &address_len) ||
++            getsockopt(s->host_fd, SOL_SOCKET, SO_TYPE, &type, &type_len) ||
++            address.ss_family != AF_UNIX || type != SOCK_SEQPACKET) {
++            error_setg(errp, "host-fd requires an inherited AF_UNIX SOCK_SEQPACKET socket");
++            return;
++        }
++    }
++    s->diagnostic_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, usb_diagnostic_tick, s);
++    virtio_init(vdev, 0x1a01, 0);
++    s->request_queue = virtio_add_queue(vdev, 256, usb_request_kick);
++    s->response_queue = virtio_add_queue(vdev, 256, usb_response_kick);
++    error_setg(&s->migration_blocker,
++               "experimental VMApple USB transport has no migration state");
++    if (migrate_add_blocker(&s->migration_blocker, errp) < 0) {
++        timer_free(s->diagnostic_timer);
++        virtio_cleanup(vdev);
++        return;
++    }
++    if (s->host_fd >= 0) {
++        s->host_timer = timer_new_us(QEMU_CLOCK_VIRTUAL, usb_host_tick, s);
++        timer_mod(s->host_timer, qemu_clock_get_us(QEMU_CLOCK_VIRTUAL) + s->host_poll_us);
++    }
++}
++
++static void usb_unrealize(DeviceState *dev)
++{
++    VMAppleUSB *s = VMAPPLE_USB(dev);
++
++    if (s->host_timer) {
++        timer_free(s->host_timer);
++    }
++    timer_free(s->diagnostic_timer);
++    migrate_del_blocker(&s->migration_blocker);
++    virtio_cleanup(VIRTIO_DEVICE(dev));
++}
++
++static const Property usb_properties[] = {
++    DEFINE_PROP_INT32("host-fd", VMAppleUSB, host_fd, -1),
++    DEFINE_PROP_UINT32("host-poll-us", VMAppleUSB, host_poll_us, 2000),
++};
++
++static void usb_class_init(ObjectClass *klass, const void *data)
++{
++    VirtioDeviceClass *vdc = VIRTIO_DEVICE_CLASS(klass);
++
++    device_class_set_props(DEVICE_CLASS(klass), usb_properties);
++    vdc->realize = usb_realize;
++    vdc->unrealize = usb_unrealize;
++    vdc->get_features = usb_features;
++    vdc->set_status = usb_status;
++}
++
++static void usb_pci_realize(VirtIOPCIProxy *proxy, Error **errp)
++{
++    VMAppleUSBPCI *s = VMAPPLE_USB_PCI(proxy);
++
++    virtio_pci_force_virtio_1(proxy);
++    proxy->nvectors = 3;
++    if (!qdev_realize(DEVICE(&s->vdev), BUS(&proxy->bus), errp)) {
++        return;
++    }
++    pci_config_set_vendor_id(proxy->pci_dev.config, 0x106b);
++    pci_config_set_device_id(proxy->pci_dev.config, 0x1a01);
++}
++
++static void usb_pci_init(Object *obj)
++{
++    VMAppleUSBPCI *s = VMAPPLE_USB_PCI(obj);
++
++    virtio_instance_init_common(obj, &s->vdev, sizeof(s->vdev), TYPE_VMAPPLE_USB);
++}
++
++static void usb_pci_class_init(ObjectClass *klass, const void *data)
++{
++    VirtioPCIClass *vpc = VIRTIO_PCI_CLASS(klass);
++    PCIDeviceClass *pc = PCI_DEVICE_CLASS(klass);
++    DeviceClass *dc = DEVICE_CLASS(klass);
++
++    vpc->realize = usb_pci_realize;
++    pc->vendor_id = 0x106b;
++    pc->device_id = 0x1a01;
++    pc->class_id = PCI_CLASS_OTHERS;
++    dc->desc = "Experimental VMApple USB transport (no host backend yet)";
++}
++
++static const TypeInfo usb_info = {
++    .name = TYPE_VMAPPLE_USB,
++    .parent = TYPE_VIRTIO_DEVICE,
++    .instance_size = sizeof(VMAppleUSB),
++    .class_init = usb_class_init,
++};
++
++static const VirtioPCIDeviceTypeInfo usb_pci_info = {
++    .generic_name = TYPE_VMAPPLE_USB_PCI,
++    .instance_size = sizeof(VMAppleUSBPCI),
++    .instance_init = usb_pci_init,
++    .class_init = usb_pci_class_init,
++};
++
++static void usb_register_types(void)
++{
++    type_register_static(&usb_info);
++    virtio_pci_types_register(&usb_pci_info);
++}
++
++type_init(usb_register_types)
+diff --git a/hw/vmapple/meson.build b/hw/vmapple/meson.build
+--- a/hw/vmapple/meson.build
++++ b/hw/vmapple/meson.build
+@@ -6,2 +6,3 @@
+ system_ss.add(when: 'CONFIG_VMAPPLE_VIRTIO_BLK',  if_true: files('virtio-blk.c'))
++system_ss.add(when: 'CONFIG_VMAPPLE_VIRTIO_BLK', if_true: files('virtio-usb.c'))
+ specific_ss.add(when: 'CONFIG_VMAPPLE',     if_true: files('vmapple.c'))
+diff --git a/hw/virtio/virtio.c b/hw/virtio/virtio.c
+index daa56073..23141a11 100644
+--- a/hw/virtio/virtio.c
++++ b/hw/virtio/virtio.c
+@@ -203,6 +203,10 @@ const char *virtio_device_names[] = {
+ 
+ static const char *virtio_id_to_name(uint16_t device_id)
+ {
++    /* VMApple USB uses a private identifier outside the standard ID table. */
++    if (device_id == 0x1a01) {
++        return "vmapple-virtio-usb";
++    }
+     assert(device_id < G_N_ELEMENTS(virtio_device_names));
+     const char *name = virtio_device_names[device_id];
+     assert(name != NULL);

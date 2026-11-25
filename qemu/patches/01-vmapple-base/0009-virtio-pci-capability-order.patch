@@ -1,0 +1,57 @@
+diff --git a/hw/virtio/virtio-pci.c b/hw/virtio/virtio-pci.c
+index 6f5db5f..f28ca24 100644
+--- a/hw/virtio/virtio-pci.c
++++ b/hw/virtio/virtio-pci.c
+@@ -2140,6 +2140,32 @@ static void virtio_pci_device_plugged(DeviceState *d, Error **errp)
+         }
+     }
+ 
++    if (proxy->ascending_caps) {
++        config = proxy->pci_dev.config;
++        uint8_t offsets[PCI_CONFIG_SPACE_SIZE / 4];
++        bool present[PCI_CONFIG_SPACE_SIZE] = { false };
++        unsigned n = 0, at = config[PCI_CAPABILITY_LIST];
++
++        while (at) {
++            assert(at >= PCI_CONFIG_HEADER_SIZE && !(at & 3));
++            assert(!present[at] && n < ARRAY_SIZE(offsets));
++            present[at] = true;
++            offsets[n++] = at;
++            at = config[at + PCI_CAP_LIST_NEXT];
++        }
++        n = 0;
++        for (at = PCI_CONFIG_HEADER_SIZE; at < PCI_CONFIG_SPACE_SIZE; at += 4) {
++            if (present[at]) {
++                offsets[n++] = at;
++            }
++        }
++        config[PCI_CAPABILITY_LIST] = n ? offsets[0] : 0;
++        for (at = 0; at < n; at++) {
++            config[offsets[at] + PCI_CAP_LIST_NEXT] =
++                at + 1 < n ? offsets[at + 1] : 0;
++        }
++    }
++
+     proxy->pci_dev.config_write = virtio_write_config;
+     proxy->pci_dev.config_read = virtio_read_config;
+ 
+@@ -2399,6 +2425,7 @@ static void virtio_pci_bus_reset_hold(Object *obj, ResetType type)
+ }
+ 
+ static const Property virtio_pci_properties[] = {
++    DEFINE_PROP_BOOL("x-ascending-capabilities", VirtIOPCIProxy, ascending_caps, false),
+     DEFINE_PROP_BIT("virtio-pci-bus-master-bug-migration", VirtIOPCIProxy, flags,
+                     VIRTIO_PCI_FLAG_BUS_MASTER_BUG_MIGRATION_BIT, false),
+     DEFINE_PROP_BIT("modern-pio-notify", VirtIOPCIProxy, flags,
+diff --git a/include/hw/virtio/virtio-pci.h b/include/hw/virtio/virtio-pci.h
+index ee50fb0..e16a9ae 100644
+--- a/include/hw/virtio/virtio-pci.h
++++ b/include/hw/virtio/virtio-pci.h
+@@ -138,6 +138,7 @@ struct VirtIOPCIProxy {
+     uint16_t last_pcie_cap_offset;
+     uint32_t flags;
+     bool disable_modern;
++    bool ascending_caps;
+     OnOffAuto disable_legacy;
+     /* Transitional device id */
+     uint16_t trans_devid;

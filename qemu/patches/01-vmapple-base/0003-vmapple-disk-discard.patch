@@ -1,0 +1,115 @@
+diff --git a/hw/block/virtio-blk.c b/hw/block/virtio-blk.c
+index bdd76c10..82426421 100644
+--- a/hw/block/virtio-blk.c
++++ b/hw/block/virtio-blk.c
+@@ -378,6 +378,30 @@ static bool virtio_blk_sect_range_ok(VirtIOBlock *dev,
+     return true;
+ }
+ 
++typedef struct VirtIOBlkLargeDiscard {
++    VirtIOBlockReq *req;
++    int64_t offset;
++    int64_t remaining;
++} VirtIOBlkLargeDiscard;
++
++static void virtio_blk_large_discard_next(void *opaque, int ret)
++{
++    VirtIOBlkLargeDiscard *op = opaque;
++    int64_t bytes;
++
++    if (ret || !op->remaining) {
++        VirtIOBlockReq *req = op->req;
++        g_free(op);
++        virtio_blk_discard_write_zeroes_complete(req, ret);
++        return;
++    }
++    bytes = MIN(op->remaining, BDRV_REQUEST_MAX_BYTES);
++    op->remaining -= bytes;
++    op->offset += bytes;
++    blk_aio_pdiscard(op->req->dev->blk, op->offset - bytes, bytes,
++                     virtio_blk_large_discard_next, op);
++}
++
+ static uint8_t virtio_blk_handle_discard_write_zeroes(VirtIOBlockReq *req,
+     struct virtio_blk_discard_write_zeroes *dwz_hdr, bool is_write_zeroes)
+ {
+@@ -386,7 +410,10 @@ static uint8_t virtio_blk_handle_discard_write_zeroes(VirtIOBlockReq *req,
+     uint64_t sector;
+     uint32_t num_sectors, flags, max_sectors;
+     uint8_t err_status;
+-    int bytes;
++    int64_t bytes;
++    uint64_t total_sectors;
++    bool large_discard = !is_write_zeroes &&
++                         VIRTIO_BLK_GET_CLASS(s)->allow_large_discard;
+ 
+     sector = virtio_ldq_p(vdev, &dwz_hdr->sector);
+     num_sectors = virtio_ldl_p(vdev, &dwz_hdr->num_sectors);
+@@ -401,14 +428,21 @@ static uint8_t virtio_blk_handle_discard_write_zeroes(VirtIOBlockReq *req,
+      * make us sure that "num_sectors << BDRV_SECTOR_BITS" can fit in
+      * the integer variable.
+      */
+-    if (unlikely(num_sectors > max_sectors)) {
++    if (unlikely(!large_discard && num_sectors > max_sectors)) {
+         err_status = VIRTIO_BLK_S_IOERR;
+         goto err;
+     }
+ 
+-    bytes = num_sectors << BDRV_SECTOR_BITS;
++    bytes = (int64_t)num_sectors << BDRV_SECTOR_BITS;
+ 
+-    if (unlikely(!virtio_blk_sect_range_ok(s, sector, bytes))) {
++    /* The int64_t backend discard API splits at its driver limits. */
++    blk_get_geometry(s->blk, &total_sectors);
++    if (unlikely(large_discard ?
++                 ((sector & s->sector_mask) ||
++                  bytes % s->conf.conf.logical_block_size ||
++                  sector > total_sectors ||
++                  num_sectors > total_sectors - sector) :
++                 !virtio_blk_sect_range_ok(s, sector, bytes))) {
+         err_status = VIRTIO_BLK_S_IOERR;
+         goto err;
+     }
+@@ -445,8 +479,16 @@ static uint8_t virtio_blk_handle_discard_write_zeroes(VirtIOBlockReq *req,
+             goto err;
+         }
+ 
+-        blk_aio_pdiscard(s->blk, sector << BDRV_SECTOR_BITS, bytes,
+-                         virtio_blk_discard_write_zeroes_complete, req);
++        if (large_discard && bytes > BDRV_REQUEST_MAX_BYTES) {
++            VirtIOBlkLargeDiscard *op = g_new0(VirtIOBlkLargeDiscard, 1);
++            op->req = req;
++            op->offset = sector << BDRV_SECTOR_BITS;
++            op->remaining = bytes;
++            virtio_blk_large_discard_next(op, 0);
++        } else {
++            blk_aio_pdiscard(s->blk, sector << BDRV_SECTOR_BITS, bytes,
++                             virtio_blk_discard_write_zeroes_complete, req);
++        }
+     }
+ 
+     return VIRTIO_BLK_S_OK;
+diff --git a/hw/vmapple/virtio-blk.c b/hw/vmapple/virtio-blk.c
+index 9de9aaae..828b9b19 100644
+--- a/hw/vmapple/virtio-blk.c
++++ b/hw/vmapple/virtio-blk.c
+@@ -87,6 +87,7 @@ static void vmapple_virtio_blk_class_init(ObjectClass *klass, const void *data)
+     VirtioDeviceClass *vdc = VIRTIO_DEVICE_CLASS(klass);
+     VMAppleVirtIOBlkClass *vvbk = VMAPPLE_VIRTIO_BLK_CLASS(klass);
+ 
++    vbk->allow_large_discard = true;
+     vbk->handle_unknown_request = vmapple_virtio_blk_handle_unknown_request;
+     vvbk->get_config = vdc->get_config;
+     vdc->get_config = vmapple_virtio_blk_get_config;
+diff --git a/include/hw/virtio/virtio-blk.h b/include/hw/virtio/virtio-blk.h
+index 3d8dee7e..d73082c4 100644
+--- a/include/hw/virtio/virtio-blk.h
++++ b/include/hw/virtio/virtio-blk.h
+@@ -104,6 +104,7 @@ typedef struct VirtIOBlkClass {
+     /*< private >*/
+     VirtioDeviceClass parent;
+     /*< public >*/
++    bool allow_large_discard;
+     bool (*handle_unknown_request)(VirtIOBlockReq *req, MultiReqBuffer *mrb,
+                                    uint32_t type);
+ } VirtIOBlkClass;

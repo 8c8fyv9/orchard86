@@ -1,0 +1,113 @@
+diff --git a/hw/vmapple/vmapple.c b/hw/vmapple/vmapple.c
+index 4b18108..11379cd 100644
+--- a/hw/vmapple/vmapple.c
++++ b/hw/vmapple/vmapple.c
+@@ -72,6 +72,10 @@ struct VMAppleMachineState {
+     MemoryRegion fw_mr;
+     MemoryRegion recovery_shared_mr;
+     bool recovery_shared_page;
++    MemoryRegion rtc_selector_mr;
++    bool recovery_rtc_selector;
++    uint64_t recovery_platform_control;
++    uint64_t recovery_platform_mask;
+     MemoryRegion ecam_alias;
+ #ifndef CONFIG_MAC_PVG_MMIO
+     MemoryRegion gfx_stub_mr;
+@@ -362,12 +366,68 @@ static void create_uart(const VMAppleMachineState *vms, int uart,
+     sysbus_connect_irq(s, 0, qdev_get_gpio_in(vms->gic, irq));
+ }
+ 
+-static void create_rtc(const VMAppleMachineState *vms)
++/* Local compatibility selector: advertises only the PL031 actually realized. */
++static uint64_t vmapple_rtc_selector_read(void *opaque, hwaddr offset,
++                                         unsigned size)
++{
++    VMAppleMachineState *vms = opaque;
++
++    switch (offset) {
++    case 0x00:
++        /* Independent of UTC loads; follows the migratable VM clock. */
++        return qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 1000;
++    case 0x18:
++        return vms->recovery_platform_control;
++    case 0x38:
++        return vms->recovery_platform_mask;
++    case 0x40:
++        return 0xf001;
++    default:
++        return 0;
++    }
++}
++
++static void vmapple_rtc_selector_write(void *opaque, hwaddr offset,
++                                      uint64_t value, unsigned size)
++{
++    VMAppleMachineState *vms = opaque;
++    uint64_t mask = size == 8 ? UINT64_MAX : UINT32_MAX;
++
++    /* Configuration storage only. No host events or synthetic completions. */
++    switch (offset) {
++    case 0x18:
++        vms->recovery_platform_control =
++            (vms->recovery_platform_control & ~mask) | (value & mask);
++        break;
++    case 0x38:
++        vms->recovery_platform_mask =
++            (vms->recovery_platform_mask & ~mask) | (value & mask);
++        break;
++    }
++}
++
++static const MemoryRegionOps vmapple_rtc_selector_ops = {
++    .read = vmapple_rtc_selector_read,
++    .write = vmapple_rtc_selector_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .impl = { .min_access_size = 4, .max_access_size = 8 },
++    .valid = { .min_access_size = 4, .max_access_size = 8,
++               .unaligned = false },
++};
++
++static void create_rtc(VMAppleMachineState *vms)
+ {
+     hwaddr base = vms->memmap[VMAPPLE_RTC].base;
+     int irq = vms->irqmap[VMAPPLE_RTC];
+ 
+     sysbus_create_simple("pl031", base, qdev_get_gpio_in(vms->gic, irq));
++    if (vms->recovery_rtc_selector) {
++        memory_region_init_io(&vms->rtc_selector_mr, OBJECT(vms),
++                              &vmapple_rtc_selector_ops, vms,
++                              "vmapple-rtc-selector", 0x1000);
++        memory_region_add_subregion(get_system_memory(), 0x30240000,
++                                    &vms->rtc_selector_mr);
++    }
+ }
+ 
+ static DeviceState *gpio_key_dev;
+@@ -749,6 +809,17 @@ static void vmapple_machine_class_init(ObjectClass *oc, const void *data)
+                      G_N_ELEMENTS(vmapple_compat_defaults));
+ }
+ 
++static bool vmapple_get_recovery_rtc_selector(Object *obj, Error **errp)
++{
++    return VMAPPLE_MACHINE(obj)->recovery_rtc_selector;
++}
++
++static void vmapple_set_recovery_rtc_selector(Object *obj, bool value,
++                                              Error **errp)
++{
++    VMAPPLE_MACHINE(obj)->recovery_rtc_selector = value;
++}
++
+ static bool vmapple_get_recovery_shared_page(Object *obj, Error **errp)
+ {
+     return VMAPPLE_MACHINE(obj)->recovery_shared_page;
+@@ -779,6 +850,9 @@ static void vmapple_instance_init(Object *obj)
+                                    OBJ_PROP_FLAG_READWRITE);
+     object_property_set_description(obj, "uuid", "Machine UUID (SDOM)");
+ 
++    object_property_add_bool(obj, "recovery-rtc-selector",
++                             vmapple_get_recovery_rtc_selector,
++                             vmapple_set_recovery_rtc_selector);
+     object_property_add_bool(obj, "recovery-shared-page",
+                              vmapple_get_recovery_shared_page,
+                              vmapple_set_recovery_shared_page);

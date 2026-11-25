@@ -1,0 +1,127 @@
+From 8c9721a29db204718ebebf6030111aae11dddaab Mon Sep 17 00:00:00 2001
+From: cheems <cheems>
+Date: Tue, 24 Nov 2026 17:03:49 +0800
+Subject: [PATCH] perf(arm/tcg): Phase B3 SSSE3/AVX vpshufb fast-path for TBL
+ and inline TCG RBIT32/RBIT64
+
+---
+ target/arm/tcg/translate-a64.c | 49 ++++++++++++++++++++++++++++++++--
+ target/arm/tcg/vec_helper64.c  | 28 +++++++++++++++++++
+ 2 files changed, 75 insertions(+), 2 deletions(-)
+
+diff --git a/target/arm/tcg/translate-a64.c b/target/arm/tcg/translate-a64.c
+index f641045f..912e356b 100644
+--- a/target/arm/tcg/translate-a64.c
++++ b/target/arm/tcg/translate-a64.c
+@@ -9495,7 +9495,52 @@ static void gen_wrap2_i32(TCGv_i64 d, TCGv_i64 n, NeonGenOneOpFn fn)
+ 
+ static void gen_rbit32(TCGv_i64 tcg_rd, TCGv_i64 tcg_rn)
+ {
+-    gen_wrap2_i32(tcg_rd, tcg_rn, gen_helper_rbit);
++    TCGv_i64 t0 = tcg_temp_new_i64();
++    TCGv_i64 t1 = tcg_temp_new_i64();
++
++    tcg_gen_bswap32_i64(t0, tcg_rn, TCG_BSWAP_OZ);
++    tcg_gen_shri_i64(t1, t0, 4);
++    tcg_gen_andi_i64(t0, t0, 0x0f0f0f0full);
++    tcg_gen_andi_i64(t1, t1, 0x0f0f0f0full);
++    tcg_gen_shli_i64(t0, t0, 4);
++    tcg_gen_or_i64(t0, t0, t1);
++
++    tcg_gen_shri_i64(t1, t0, 2);
++    tcg_gen_andi_i64(t0, t0, 0x33333333ull);
++    tcg_gen_andi_i64(t1, t1, 0x33333333ull);
++    tcg_gen_shli_i64(t0, t0, 2);
++    tcg_gen_or_i64(t0, t0, t1);
++
++    tcg_gen_shri_i64(t1, t0, 1);
++    tcg_gen_andi_i64(t0, t0, 0x55555555ull);
++    tcg_gen_andi_i64(t1, t1, 0x55555555ull);
++    tcg_gen_shli_i64(t0, t0, 1);
++    tcg_gen_or_i64(tcg_rd, t0, t1);
++}
++
++static void gen_rbit64(TCGv_i64 tcg_rd, TCGv_i64 tcg_rn)
++{
++    TCGv_i64 t0 = tcg_temp_new_i64();
++    TCGv_i64 t1 = tcg_temp_new_i64();
++
++    tcg_gen_bswap64_i64(t0, tcg_rn);
++    tcg_gen_shri_i64(t1, t0, 4);
++    tcg_gen_andi_i64(t0, t0, 0x0f0f0f0f0f0f0f0full);
++    tcg_gen_andi_i64(t1, t1, 0x0f0f0f0f0f0f0f0full);
++    tcg_gen_shli_i64(t0, t0, 4);
++    tcg_gen_or_i64(t0, t0, t1);
++
++    tcg_gen_shri_i64(t1, t0, 2);
++    tcg_gen_andi_i64(t0, t0, 0x3333333333333333ull);
++    tcg_gen_andi_i64(t1, t1, 0x3333333333333333ull);
++    tcg_gen_shli_i64(t0, t0, 2);
++    tcg_gen_or_i64(t0, t0, t1);
++
++    tcg_gen_shri_i64(t1, t0, 1);
++    tcg_gen_andi_i64(t0, t0, 0x5555555555555555ull);
++    tcg_gen_andi_i64(t1, t1, 0x5555555555555555ull);
++    tcg_gen_shli_i64(t0, t0, 1);
++    tcg_gen_or_i64(tcg_rd, t0, t1);
+ }
+ 
+ static void gen_rev16_xx(TCGv_i64 tcg_rd, TCGv_i64 tcg_rn, TCGv_i64 mask)
+@@ -9530,7 +9575,7 @@ static void gen_rev32(TCGv_i64 tcg_rd, TCGv_i64 tcg_rn)
+     tcg_gen_rotri_i64(tcg_rd, tcg_rd, 32);
+ }
+ 
+-TRANS(RBIT, gen_rr, a->rd, a->rn, a->sf ? gen_helper_rbit64 : gen_rbit32)
++TRANS(RBIT, gen_rr, a->rd, a->rn, a->sf ? gen_rbit64 : gen_rbit32)
+ TRANS(REV16, gen_rr, a->rd, a->rn, a->sf ? gen_rev16_64 : gen_rev16_32)
+ TRANS(REV32, gen_rr, a->rd, a->rn, a->sf ? gen_rev32 : gen_rev_32)
+ TRANS(REV64, gen_rr, a->rd, a->rn, tcg_gen_bswap64_i64)
+diff --git a/target/arm/tcg/vec_helper64.c b/target/arm/tcg/vec_helper64.c
+index d8b25b86..7ce64ec3 100644
+--- a/target/arm/tcg/vec_helper64.c
++++ b/target/arm/tcg/vec_helper64.c
+@@ -18,6 +18,9 @@
+ #include "qemu/int128.h"
+ #include "crypto/clmul.h"
+ #include "vec_internal.h"
++#if defined(__SSSE3__) && !HOST_BIG_ENDIAN
++#include <tmmintrin.h>
++#endif
+ 
+ DO_3OP(gvec_fdiv_h, float16_div, float16)
+ DO_3OP(gvec_fdiv_s, float32_div, float32)
+@@ -104,6 +107,31 @@ void HELPER(simd_tblx)(void *vd, void *vm, CPUARMState *env, uint32_t desc)
+     uint32_t rn = extract32(desc, SIMD_DATA_SHIFT, 5);
+     bool is_tbx = extract32(desc, SIMD_DATA_SHIFT + 5, 1);
+     uint32_t table_len = desc >> (SIMD_DATA_SHIFT + 6);
++
++#if defined(__SSSE3__) && !HOST_BIG_ENDIAN
++    if (!is_tbx && table_len == 16) {
++        __m128i tbl = _mm_loadu_si128((const __m128i *)aa64_vfp_qreg(env, rn));
++        __m128i idx = _mm_loadu_si128((const __m128i *)vm);
++        __m128i adj = _mm_adds_epu8(idx, _mm_set1_epi8(0x70));
++        __m128i res = _mm_shuffle_epi8(tbl, adj);
++        _mm_storeu_si128((__m128i *)vd, res);
++        clear_tail(vd, oprsz, simd_maxsz(desc));
++        return;
++    }
++    if (!is_tbx && table_len == 32) {
++        __m128i t0 = _mm_loadu_si128((const __m128i *)aa64_vfp_qreg(env, rn));
++        __m128i t1 = _mm_loadu_si128((const __m128i *)aa64_vfp_qreg(env, (rn + 1) & 31));
++        __m128i idx = _mm_loadu_si128((const __m128i *)vm);
++        __m128i c70 = _mm_set1_epi8(0x70);
++        __m128i r0 = _mm_shuffle_epi8(t0, _mm_adds_epu8(idx, c70));
++        __m128i r1 = _mm_shuffle_epi8(
++            t1, _mm_adds_epu8(_mm_xor_si128(idx, _mm_set1_epi8(0x10)), c70));
++        _mm_storeu_si128((__m128i *)vd, _mm_or_si128(r0, r1));
++        clear_tail(vd, oprsz, simd_maxsz(desc));
++        return;
++    }
++#endif
++
+     union {
+         uint8_t b[16];
+         uint64_t d[2];
+-- 
+2.47.3
+

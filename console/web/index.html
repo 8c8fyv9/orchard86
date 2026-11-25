@@ -1,0 +1,28 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>macOS 虚拟机控制台</title>
+<link rel="stylesheet" href="/assets/console.css">
+<header>
+  <strong>macOS 控制台</strong>
+  <span id="status" role="status">正在加载…</span>
+  <button id="connection" disabled>连接</button>
+  <button id="performance" aria-expanded="false" aria-controls="stream-stats">画面性能</button>
+  <button id="fullscreen">全屏</button>
+  <button id="switch-app" disabled title="向虚拟机发送 Command+Tab">⌘ Tab</button>
+  <button id="force-quit" disabled title="向虚拟机发送 Command+Option+Esc">⌘ ⌥ Esc</button>
+</header>
+<aside id="stream-stats" hidden aria-label="画面性能">
+  <dl>
+    <div><dt>画布更新</dt><dd id="stats-rate">—</dd></div>
+    <div><dt>VNC 下行</dt><dd id="stats-down">—</dd></div>
+    <div><dt>画布分辨率</dt><dd id="stats-size">—</dd></div>
+    <div><dt>距上次画布更新</dt><dd id="stats-age">—</dd></div>
+  </dl>
+  <small>浏览器侧 RFB 统计。静止桌面更新率可为零；不是 GPU FPS 或端到端延迟。</small>
+</aside>
+<main id="screen" aria-label="虚拟机屏幕"></main>
+<script type="module" src="/assets/console.js"></script>
+</html>

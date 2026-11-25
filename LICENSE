@@ -1,0 +1,10 @@
+orchard86 采用分层双许可：
+
+1. 主机侧工具链与控制面代码（`boot/`、`console/`、`graphics/`、`restore/`、`qemu/build.sh`、`qemu/tests/`）
+   依据 GNU General Public License v3.0 or later（`GPL-3.0-or-later`）发布，全文见 `COPYING.GPL3`。
+   这些组件通过独立子进程、UNIX Socket（QMP / `SOCK_SEQPACKET`）或 C ABI 与 QEMU 隔离交互。
+
+2. QEMU 补丁栈（`qemu/patches/`）
+   为保持与 QEMU 基线（`GPL-2.0-only` / `GPL-2.0-or-later`）的完全兼容，所有 `qemu/patches/` 下的补丁均依据 GNU General Public License v2.0 or later（`GPL-2.0-or-later`）发布，全文见 `COPYING`（另附 `COPYING.LIB` 对应 LGPL-2.1 继承组件）；修改源自上游/第三方的文件时保留原有版权声明。
+
+3. 第三方与专有资产边界见 `docs/third-party.md`。

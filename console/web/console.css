@@ -1,0 +1,11 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+:root { color-scheme: dark; font: 15px system-ui, sans-serif; }
+body { margin: 0; height: 100dvh; display: flex; flex-direction: column; background: #181a20; }
+header { display: flex; align-items: center; gap: .75rem; flex-wrap: wrap; padding: .65rem 1rem; }
+#status { margin-inline-end: auto; }
+button { font: inherit; padding: .3rem .65rem; }
+#stream-stats { padding: .65rem 1rem; background: #242831; }
+#stream-stats dl { display: flex; flex-wrap: wrap; gap: .5rem 1.75rem; margin: 0 0 .4rem; }
+#stream-stats dt, #stream-stats small { color: #b9c2d1; }
+#stream-stats dd { margin: .2rem 0 0; font-variant-numeric: tabular-nums; }
+#screen { flex: 1; min-height: 0; min-width: 0; background: #08090b; overflow: hidden; }

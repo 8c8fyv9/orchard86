@@ -1,0 +1,374 @@
+diff --git a/hw/vmapple/bdif.c b/hw/vmapple/bdif.c
+index 4dc10c1..9881b27 100644
+--- a/hw/vmapple/bdif.c
++++ b/hw/vmapple/bdif.c
+@@ -20,6 +20,9 @@
+ #include "qapi/error.h"
+ #include "system/block-backend.h"
+ #include "system/dma.h"
++#include "qemu/rcu.h"
++#include "qemu/sockets.h"
++#include "migration/blocker.h"
+ 
+ OBJECT_DECLARE_SIMPLE_TYPE(VMAppleBdifState, VMAPPLE_BDIF)
+ 
+@@ -28,7 +31,17 @@ struct VMAppleBdifState {
+ 
+     BlockBackend *aux;
+     BlockBackend *root;
++    bool aux_writable;
+     MemoryRegion mmio;
++    int32_t recovery_host_fd;
++    Error *recovery_migration_blocker;
++    uint8_t recovery_packet[4096];
++    size_t recovery_packet_len;
++    bool recovery_rx_ready;
++    uint32_t recovery_queue;
++    uint32_t recovery_config;
++    hwaddr recovery_pending;
++    uint8_t recovery_pending_descriptor[16];
+ };
+ 
+ #define VMAPPLE_BDIF_SIZE   0x00200000
+@@ -75,8 +88,120 @@ typedef struct VblkReq {
+ #define VBLK_RET_SUCCESS  0
+ #define VBLK_RET_FAILED   1
+ 
++/* Diagnostic scope: one fixed control request, one two-byte response. */
++static bool recovery_ram_range(hwaddr addr, hwaddr len)
++{
++    hwaddr translated, available = len;
++    MemoryRegion *mr;
++    bool valid;
++
++    if (!len || addr > UINT64_MAX - len) {
++        return false;
++    }
++    rcu_read_lock();
++    mr = address_space_translate(&address_space_memory, addr, &translated,
++                                 &available, true, MEMTXATTRS_UNSPECIFIED);
++    valid = available >= len && memory_region_is_ram(mr) &&
++            !memory_region_is_rom(mr) && !memory_region_is_ram_device(mr);
++    rcu_read_unlock();
++    return valid;
++}
++
++static bool recovery_ram(hwaddr addr, hwaddr len)
++{
++    return len <= 4096 && recovery_ram_range(addr, len);
++}
++
++
++/* Real host transport is opt-in.
++ * The guest polls REG_BUSY; retry a posted RX descriptor there without timers.
++ */
++static void recovery_host_command(VMAppleBdifState *s, hwaddr addr)
++{
++    uint8_t descriptor[16], data[4096];
++    uint64_t buffer;
++    uint32_t len;
++    uint16_t flags;
++    ssize_t n;
++
++    if (s->recovery_queue > 1 || !s->recovery_config || (addr & 15) ||
++        !recovery_ram(addr, 16) ||
++        dma_memory_read(&address_space_memory, addr, descriptor, 16,
++                        MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
++        return;
++    }
++    buffer = ldq_le_p(descriptor);
++    len = ldl_le_p(descriptor + 8);
++    flags = lduw_le_p(descriptor + 14);
++    if (lduw_le_p(descriptor + 12) != 1 ||
++        flags != (s->recovery_queue == 0 ? 2 : 0) ||
++        !(s->recovery_queue == 0 ? recovery_ram_range(buffer, len) :
++                                  recovery_ram(buffer, len)) ||
++        (buffer < addr + 16 && addr < buffer + len)) {
++        return;
++    }
++    if (s->recovery_queue == 0) {
++        s->recovery_rx_ready = false;
++        if (s->recovery_pending &&
++            (s->recovery_pending != addr ||
++             memcmp(descriptor, s->recovery_pending_descriptor, 16))) {
++            /* A validated submission replaces the old stage's RX buffer.
++             * Keep an already received host packet for the new descriptor. */
++            s->recovery_pending = 0;
++        }
++        s->recovery_pending = addr;
++        memcpy(s->recovery_pending_descriptor, descriptor, 16);
++        if (!s->recovery_packet_len) {
++            n = recv(s->recovery_host_fd, s->recovery_packet,
++                     sizeof(s->recovery_packet), MSG_DONTWAIT | MSG_TRUNC);
++            if (n < 6 || n > sizeof(s->recovery_packet) ||
++                s->recovery_packet[5] < 1 || s->recovery_packet[5] > 3) {
++                return;
++            }
++            s->recovery_packet_len = n;
++        }
++        if (s->recovery_packet_len > len ||
++            dma_memory_write(&address_space_memory, buffer,
++                             s->recovery_packet, s->recovery_packet_len,
++                             MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
++            return;
++        }
++    } else {
++        if (len < 2 || dma_memory_read(&address_space_memory, buffer, data,
++                                      len, MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
++            return;
++        }
++        n = send(s->recovery_host_fd, data, len,
++                 MSG_DONTWAIT | MSG_NOSIGNAL);
++        if (n != len) {
++            return;
++        }
++    }
++    stw_le_p(descriptor + 14, flags | 1);
++    if (dma_memory_write(&address_space_memory, addr, descriptor, 16,
++                         MEMTXATTRS_UNSPECIFIED) != MEMTX_OK) {
++        return;
++    }
++    if (s->recovery_queue == 0) {
++        trace_bdif_recovery_probe("host-delivered", 0,
++                                  s->recovery_packet_len, flags);
++        s->recovery_packet_len = 0;
++        s->recovery_pending = 0;
++        s->recovery_rx_ready = true;
++    } else {
++        trace_bdif_recovery_probe("host-response", 1, len, flags);
++    }
++}
++
++static bool recovery_usb_enabled(VMAppleBdifState *s)
++{
++    return s->recovery_host_fd >= 0;
++}
++
+ static uint64_t bdif_read(void *opaque, hwaddr offset, unsigned size)
+ {
++    VMAppleBdifState *s = opaque;
++    int64_t sectors;
+     uint64_t ret = -1;
+     uint64_t devid = offset & REG_DEVID_MASK;
+ 
+@@ -85,13 +210,25 @@ static uint64_t bdif_read(void *opaque, hwaddr offset, unsigned size)
+         ret = REG_STATUS_ACTIVE;
+         break;
+     case REG_CFG:
+-        ret = REG_CFG_ACTIVE;
++        ret = devid == DEVID_USB && recovery_usb_enabled(s) ?
++              0x1a01 : REG_CFG_ACTIVE;
+         break;
+     case REG_UNK1:
+         ret = 0x420;
+         break;
+     case REG_BUSY:
+-        ret = REG_BUSY_READY;
++        if (devid == DEVID_USB && s->recovery_host_fd >= 0 &&
++            s->recovery_queue == 0 && s->recovery_pending) {
++            recovery_host_command(s, s->recovery_pending);
++        }
++        ret = devid == DEVID_USB && recovery_usb_enabled(s) ?
++              (s->recovery_queue == 1 ||
++               (s->recovery_queue == 0 && s->recovery_rx_ready)) : REG_BUSY_READY;
++        break;
++    case 0x404:
++        if (devid == DEVID_USB && recovery_usb_enabled(s) && size == 4) {
++            ret = s->recovery_config;
++        }
+         break;
+     case REG_UNK2:
+         ret = 0x1;
+@@ -102,7 +239,9 @@ static uint64_t bdif_read(void *opaque, hwaddr offset, unsigned size)
+     case REG_NEXT_DEVICE:
+         switch (devid) {
+         case DEVID_ROOT:
+-            ret = 0x8000000;
++            /* Root requests use 512-byte sectors, not a fixed disk size. */
++            sectors = blk_nb_sectors(s->root);
++            ret = sectors > 0 ? sectors : 0;
+             break;
+         case DEVID_AUX:
+             ret = 0x10000;
+@@ -135,7 +274,7 @@ static void le2cpu_req(VblkReq *req)
+ }
+ 
+ static void vblk_cmd(uint64_t devid, BlockBackend *blk, uint64_t gp_addr,
+-                     uint64_t static_off)
++                     uint64_t static_off, bool writable)
+ {
+     VblkReq req;
+     VblkSector sector;
+@@ -189,7 +328,24 @@ static void vblk_cmd(uint64_t devid, BlockBackend *blk, uint64_t gp_addr,
+         }
+         break;
+     case VBLK_DATA_FLAGS_WRITE:
+-        /* Not needed, iBoot only reads */
++        /* Opt-in for disposable recovery AUX; never acknowledge a lost write. */
++        if (!writable || !req.data.len ||
++            !recovery_ram(req.data.addr, req.data.len) ||
++            !recovery_ram(req.retval.addr, 1) ||
++            blk_getlength(blk) < 0 ||
++            off > blk_getlength(blk) ||
++            req.data.len > blk_getlength(blk) - off) {
++            break;
++        }
++        dma_result = dma_memory_read(&address_space_memory, req.data.addr, buf,
++                                     req.data.len, MEMTXATTRS_UNSPECIFIED);
++        if (dma_result != MEMTX_OK) {
++            break;
++        }
++        r = blk_pwrite(blk, off, req.data.len, buf, 0);
++        if (r == 0 && blk_flush(blk) == 0) {
++            ret = VBLK_RET_SUCCESS;
++        }
+         break;
+     default:
+         break;
+@@ -209,13 +365,35 @@ static void bdif_write(void *opaque, hwaddr offset,
+     trace_bdif_write(offset, size, value);
+ 
+     switch (offset & ~REG_DEVID_MASK) {
++    case 0x404:
++        if (devid == DEVID_USB && recovery_usb_enabled(s) &&
++            size == 4 && value < 4) {
++            s->recovery_config = value;
++            if (!value) {
++                s->recovery_pending = 0;
++                s->recovery_packet_len = 0;
++                s->recovery_rx_ready = false;
++                s->recovery_queue = UINT32_MAX;
++            }
++        }
++        break;
++    case 0x410:
++        if (devid == DEVID_USB && recovery_usb_enabled(s)) {
++            s->recovery_queue = size == 4 && value < 2 ? value : UINT32_MAX;
++        }
++        break;
+     case REG_CMD:
+         switch (devid) {
+         case DEVID_ROOT:
+-            vblk_cmd(devid, s->root, value, 0x0);
++            vblk_cmd(devid, s->root, value, 0x0, false);
+             break;
+         case DEVID_AUX:
+-            vblk_cmd(devid, s->aux, value, 0x0);
++            vblk_cmd(devid, s->aux, value, 0x0, s->aux_writable);
++            break;
++        case DEVID_USB:
++            if (size == 8 && s->recovery_host_fd >= 0) {
++                recovery_host_command(s, value);
++            }
+             break;
+         }
+         break;
+@@ -236,6 +414,17 @@ static const MemoryRegionOps bdif_ops = {
+     },
+ };
+ 
++static char *bdif_recovery_state(Object *obj, Error **errp)
++{
++    VMAppleBdifState *s = VMAPPLE_BDIF(obj);
++
++    return g_strdup_printf("config=%u queue=%u pending=0x%" PRIx64
++                           " packet=%zu ready=%u",
++                           s->recovery_config, s->recovery_queue,
++                           (uint64_t)s->recovery_pending,
++                           s->recovery_packet_len, s->recovery_rx_ready);
++}
++
+ static void bdif_init(Object *obj)
+ {
+     VMAppleBdifState *s = VMAPPLE_BDIF(obj);
+@@ -243,18 +432,73 @@ static void bdif_init(Object *obj)
+     memory_region_init_io(&s->mmio, obj, &bdif_ops, obj,
+                          "VMApple Backdoor Interface", VMAPPLE_BDIF_SIZE);
+     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->mmio);
++    object_property_add_str(obj, "recovery-state", bdif_recovery_state, NULL);
+ }
+ 
+ static const Property bdif_properties[] = {
++    DEFINE_PROP_BOOL("aux-writable", VMAppleBdifState, aux_writable, false),
++    DEFINE_PROP_INT32("recovery-host-fd", VMAppleBdifState, recovery_host_fd, -1),
+     DEFINE_PROP_DRIVE("aux", VMAppleBdifState, aux),
+     DEFINE_PROP_DRIVE("root", VMAppleBdifState, root),
+ };
+ 
++static void bdif_reset(DeviceState *dev)
++{
++    VMAppleBdifState *s = VMAPPLE_BDIF(dev);
++
++    s->recovery_pending = 0;
++    s->recovery_packet_len = 0;
++    s->recovery_config = 0;
++    s->recovery_rx_ready = false;
++    s->recovery_queue = 0;
++}
++
++static void bdif_realize(DeviceState *dev, Error **errp)
++{
++    VMAppleBdifState *s = VMAPPLE_BDIF(dev);
++    struct sockaddr_storage address;
++    socklen_t address_len = sizeof(address), type_len = sizeof(int);
++    int type;
++
++    if (s->aux_writable) {
++        if (!s->aux || !blk_supports_write_perm(s->aux)) {
++            error_setg(errp, "aux-writable requires a writable AUX backend");
++            return;
++        }
++        if (blk_set_perm(s->aux, BLK_PERM_CONSISTENT_READ | BLK_PERM_WRITE,
++                         BLK_PERM_ALL, errp) < 0) {
++            return;
++        }
++    }
++    if (s->recovery_host_fd < 0) {
++        return;
++    }
++    if (getsockname(s->recovery_host_fd, (struct sockaddr *)&address,
++                    &address_len) ||
++        getsockopt(s->recovery_host_fd, SOL_SOCKET, SO_TYPE, &type, &type_len) ||
++        address.ss_family != AF_UNIX || type != SOCK_SEQPACKET) {
++        error_setg(errp, "recovery-host-fd requires AF_UNIX SOCK_SEQPACKET");
++        return;
++    }
++    error_setg(&s->recovery_migration_blocker,
++               "VMApple recovery host transport has no migration state");
++    migrate_add_blocker(&s->recovery_migration_blocker, errp);
++}
++
++static void bdif_finalize(Object *obj)
++{
++    VMAppleBdifState *s = VMAPPLE_BDIF(obj);
++
++    migrate_del_blocker(&s->recovery_migration_blocker);
++}
++
+ static void bdif_class_init(ObjectClass *klass, const void *data)
+ {
+     DeviceClass *dc = DEVICE_CLASS(klass);
+ 
+     dc->desc = "VMApple Backdoor Interface";
++    dc->realize = bdif_realize;
++    device_class_set_legacy_reset(dc, bdif_reset);
+     device_class_set_props(dc, bdif_properties);
+ }
+ 
+@@ -263,6 +507,7 @@ static const TypeInfo bdif_info = {
+     .parent        = TYPE_SYS_BUS_DEVICE,
+     .instance_size = sizeof(VMAppleBdifState),
+     .instance_init = bdif_init,
++    .instance_finalize = bdif_finalize,
+     .class_init    = bdif_class_init,
+ };
+ 
+diff --git a/hw/vmapple/trace-events b/hw/vmapple/trace-events
+index 93380ed..b91c883 100644
+--- a/hw/vmapple/trace-events
++++ b/hw/vmapple/trace-events
+@@ -19,3 +19,4 @@ aes_dump_data(const char *desc, const char *hex) "%s%s"
+ bdif_read(uint64_t offset, uint32_t size, uint64_t value) "offset=0x%"PRIx64" size=0x%x value=0x%"PRIx64
+ bdif_write(uint64_t offset, uint32_t size, uint64_t value) "offset=0x%"PRIx64" size=0x%x value=0x%"PRIx64
+ bdif_vblk_read(const char *dev, uint64_t addr, uint64_t offset, uint32_t len, int r) "dev=%s addr=0x%"PRIx64" off=0x%"PRIx64" size=0x%x r=%d"
++bdif_recovery_probe(const char *event, uint32_t queue, uint32_t len, uint32_t flags) "event=%s queue=%u len=%u flags=%u"

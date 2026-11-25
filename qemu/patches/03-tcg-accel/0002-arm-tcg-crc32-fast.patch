@@ -1,0 +1,82 @@
+From 11f83ef13a533952a7cb843adf35df670a855402 Mon Sep 17 00:00:00 2001
+From: cheems <cheems>
+Date: Thu, 19 Nov 2026 10:53:53 +0800
+Subject: [PATCH] tcg/arm: accelerate fixed width IEEE CRC on x86 hosts
+
+---
+ target/arm/tcg/helper-a64.c | 55 +++++++++++++++++++++++++++++++++++++
+ 1 file changed, 55 insertions(+)
+
+diff --git a/target/arm/tcg/helper-a64.c b/target/arm/tcg/helper-a64.c
+index d697ac16..8b48c6c3 100644
+--- a/target/arm/tcg/helper-a64.c
++++ b/target/arm/tcg/helper-a64.c
+@@ -418,10 +418,65 @@ AH_MINMAX_HELPER(sme2_ah_fmin_b16, bfloat16, bfloat16, min)
+  * The upper bytes of val (above the number specified by 'bytes') must have
+  * been zeroed out by the caller.
+  */
++#ifdef __x86_64__
++/* Reflected IEEE CRC-32. The x86 CRC32 instruction uses CRC32C instead. */
++static uint32_t crc32_ieee_table[4][256];
++static bool crc32_ieee_fast;
++
++static void __attribute__((constructor)) crc32_ieee_init(void)
++{
++    if (g_strcmp0(g_getenv("QEMU_ARM_CRC_FAST"), "1") != 0) {
++        return;
++    }
++    for (unsigned i = 0; i < 256; i++) {
++        uint32_t c = i;
++        for (unsigned bit = 0; bit < 8; bit++) {
++            c = (c >> 1) ^ ((0u - (c & 1)) & 0xedb88320u);
++        }
++        crc32_ieee_table[0][i] = c;
++    }
++    for (unsigned i = 0; i < 256; i++) {
++        uint32_t c = crc32_ieee_table[0][i];
++        for (unsigned j = 1; j < 4; j++) {
++            c = (c >> 8) ^ crc32_ieee_table[0][c & 255];
++            crc32_ieee_table[j][i] = c;
++        }
++    }
++    crc32_ieee_fast = true;
++}
++
++static inline uint32_t crc32_ieee_word(uint32_t c)
++{
++    return crc32_ieee_table[3][c & 255] ^
++           crc32_ieee_table[2][(c >> 8) & 255] ^
++           crc32_ieee_table[1][(c >> 16) & 255] ^
++           crc32_ieee_table[0][c >> 24];
++}
++#endif
++
+ uint64_t HELPER(crc32_64)(uint64_t acc, uint64_t val, uint32_t bytes)
+ {
+     uint8_t buf[8];
+ 
++#ifdef __x86_64__
++    if (crc32_ieee_fast) {
++        uint32_t c = (uint32_t)acc ^ (uint32_t)val;
++
++        switch (bytes) {
++        case 8:
++            c = crc32_ieee_word(c) ^ (val >> 32);
++            /* fall through */
++        case 4:
++            return crc32_ieee_word(c);
++        case 2:
++            c = (c >> 8) ^ crc32_ieee_table[0][c & 255];
++            /* fall through */
++        case 1:
++            return (c >> 8) ^ crc32_ieee_table[0][c & 255];
++        }
++    }
++#endif
++
+     stq_le_p(buf, val);
+ 
+     /* zlib crc32 converts the accumulator and output to one's complement.  */
+-- 
+2.47.3
+

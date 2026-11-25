@@ -1,0 +1,140 @@
+From 76eb81fdbe93a285504da6cc40f9e76a1bf22629 Mon Sep 17 00:00:00 2001
+From: cheems <cheems>
+Date: Thu, 19 Nov 2026 16:31:27 +0800
+Subject: [PATCH] tcg: prototype direct x86 lowering for AArch64 AESE
+
+---
+ target/arm/tcg/translate-a64.c  | 23 ++++++++++++++++++++++-
+ tcg/x86_64/tcg-target-opc.h.inc |  1 +
+ tcg/x86_64/tcg-target.c.inc     | 27 +++++++++++++++++++++++++++
+ tcg/x86_64/tcg-target.h         |  7 +++++++
+ 4 files changed, 57 insertions(+), 1 deletion(-)
+
+diff --git a/target/arm/tcg/translate-a64.c b/target/arm/tcg/translate-a64.c
+index fcdd4975..f82a38e8 100644
+--- a/target/arm/tcg/translate-a64.c
++++ b/target/arm/tcg/translate-a64.c
+@@ -5660,7 +5660,28 @@ TRANS(ZIP2, do_simd_permute, a, permute_load_zip, 1)
+  * Cryptographic AES, SHA, SHA512
+  */
+ 
+-TRANS_FEAT(AESE, aa64_aes, do_gvec_op3_ool, a, 0, gen_helper_crypto_aese)
++static bool do_aese(DisasContext *s, arg_qrrr_e *a)
++{
++#ifdef TCG_TARGET_HAS_x86_aese_vec
++    if (tcg_x86_aese_direct_enabled()) {
++        if (fp_access_check(s)) {
++            TCGv_vec state = tcg_temp_new_vec(TCG_TYPE_V128);
++            TCGv_vec key = tcg_temp_new_vec(TCG_TYPE_V128);
++            int dofs = vec_full_reg_offset(s, a->rd);
++
++            tcg_gen_ld_vec(state, tcg_env, dofs);
++            tcg_gen_ld_vec(key, tcg_env, vec_full_reg_offset(s, a->rm));
++            tcg_gen_x86_aese_vec(state, state, key);
++            tcg_gen_st_vec(state, tcg_env, dofs);
++            clear_vec_high(s, true, a->rd);
++        }
++        return true;
++    }
++#endif
++    return do_gvec_op3_ool(s, a, 0, gen_helper_crypto_aese);
++}
++
++TRANS_FEAT(AESE, aa64_aes, do_aese, a)
+ TRANS_FEAT(AESD, aa64_aes, do_gvec_op3_ool, a, 0, gen_helper_crypto_aesd)
+ TRANS_FEAT(AESMC, aa64_aes, do_gvec_op2_ool, a, 0, gen_helper_crypto_aesmc)
+ TRANS_FEAT(AESIMC, aa64_aes, do_gvec_op2_ool, a, 0, gen_helper_crypto_aesimc)
+diff --git a/tcg/x86_64/tcg-target-opc.h.inc b/tcg/x86_64/tcg-target-opc.h.inc
+index 8a5cb34d..18b4dd0c 100644
+--- a/tcg/x86_64/tcg-target-opc.h.inc
++++ b/tcg/x86_64/tcg-target-opc.h.inc
+@@ -36,3 +36,4 @@ DEF(x86_vpshldi_vec, 1, 2, 1, TCG_OPF_VECTOR)
+ DEF(x86_vpshldv_vec, 1, 3, 0, TCG_OPF_VECTOR)
+ DEF(x86_vpshrdv_vec, 1, 3, 0, TCG_OPF_VECTOR)
+ DEF(x86_vgf2p8affineqb_vec, 1, 2, 1, TCG_OPF_VECTOR)
++DEF(x86_aese_vec, 1, 2, 0, TCG_OPF_VECTOR)
+diff --git a/tcg/x86_64/tcg-target.c.inc b/tcg/x86_64/tcg-target.c.inc
+index 1fc45e4e..07e97f9a 100644
+--- a/tcg/x86_64/tcg-target.c.inc
++++ b/tcg/x86_64/tcg-target.c.inc
+@@ -362,6 +362,7 @@ static bool tcg_target_const_match(int64_t val, int ct,
+ #define OPC_PUNPCKHDQ   (0x6a | P_EXT | P_DATA16)
+ #define OPC_PUNPCKHQDQ  (0x6d | P_EXT | P_DATA16)
+ #define OPC_PXOR        (0xef | P_EXT | P_DATA16)
++#define OPC_VAESENCLAST (0xdd | P_EXT38 | P_DATA16)
+ #define OPC_POP_r32	(0x58)
+ #define OPC_POPCNT      (0xb8 | P_EXT | P_SIMDF3)
+ #define OPC_PUSH_r32	(0x50)
+@@ -3773,6 +3774,13 @@ static void tcg_out_vec_op(TCGContext *s, TCGOpcode opc,
+         insn = vpshldi_insn[vece];
+         sub = args[3];
+         goto gen_simd_imm8;
++    case INDEX_op_x86_aese_vec:
++        tcg_debug_assert(type == TCG_TYPE_V128);
++        /* Arm adds the round key before SubBytes/ShiftRows, not after. */
++        tcg_out_vex_modrm(s, OPC_PXOR, a0, a1, a2);
++        tcg_out_vex_modrm(s, OPC_PXOR, TCG_TMP_VEC, TCG_TMP_VEC, TCG_TMP_VEC);
++        tcg_out_vex_modrm(s, OPC_VAESENCLAST, a0, a0, TCG_TMP_VEC);
++        break;
+     case INDEX_op_x86_vgf2p8affineqb_vec:
+         insn = OPC_VGF2P8AFFINEQB;
+         sub = args[3];
+@@ -3882,6 +3890,7 @@ tcg_target_op_def(TCGOpcode op, TCGType type, unsigned flags)
+     case INDEX_op_x86_punpckh_vec:
+     case INDEX_op_x86_vpshldi_vec:
+     case INDEX_op_x86_vgf2p8affineqb_vec:
++    case INDEX_op_x86_aese_vec:
+         return C_O1_I2(x, x, x);
+ 
+     case INDEX_op_abs_vec:
+@@ -4027,6 +4036,20 @@ int tcg_can_emit_vec_op(TCGOpcode opc, TCGType type, unsigned vece)
+     }
+ }
+ 
++static bool x86_aese_direct;
++
++bool tcg_x86_aese_direct_enabled(void)
++{
++    return x86_aese_direct;
++}
++
++void tcg_gen_x86_aese_vec(TCGv_vec ret, TCGv_vec state, TCGv_vec key)
++{
++    tcg_debug_assert(x86_aese_direct);
++    vec_gen_3(INDEX_op_x86_aese_vec, TCG_TYPE_V128, MO_8, tcgv_vec_arg(ret),
++              tcgv_vec_arg(state), tcgv_vec_arg(key));
++}
++
+ static void gen_vgf2p8affineqb0(TCGType type, TCGv_vec v0,
+                                 TCGv_vec v1, uint64_t matrix)
+ {
+@@ -4511,6 +4534,10 @@ static void tcg_out_nop_fill(tcg_insn_unit *p, int count)
+ 
+ static void tcg_target_init(TCGContext *s)
+ {
++    /* VEX.128 VAESENCLAST needs AES and OS-enabled AVX, not VAES. */
++    x86_aese_direct = have_avx1 && (cpuinfo & CPUINFO_AES) &&
++        g_strcmp0(g_getenv("QEMU_ARM_AESE_DIRECT"), "1") == 0;
++
+     tcg_target_available_regs[TCG_TYPE_I32] = ALL_GENERAL_REGS;
+     tcg_target_available_regs[TCG_TYPE_I64] = ALL_GENERAL_REGS;
+     if (have_avx1) {
+diff --git a/tcg/x86_64/tcg-target.h b/tcg/x86_64/tcg-target.h
+index 7ebae56a..89d9bc0d 100644
+--- a/tcg/x86_64/tcg-target.h
++++ b/tcg/x86_64/tcg-target.h
+@@ -79,4 +79,11 @@ typedef enum {
+     TCG_REG_CALL_STACK = TCG_REG_ESP
+ } TCGReg;
+ 
++/* Private lowering for AArch64 AdvSIMD AESE. */
++#define TCG_TARGET_HAS_x86_aese_vec 1
++struct TCGv_vec_d;
++bool tcg_x86_aese_direct_enabled(void);
++void tcg_gen_x86_aese_vec(struct TCGv_vec_d *ret, struct TCGv_vec_d *state,
++                          struct TCGv_vec_d *key);
++
+ #endif
+-- 
+2.47.3
+
